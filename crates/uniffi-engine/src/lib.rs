@@ -1,10 +1,9 @@
 //! Programmatic UniFFI frontend for napi-rs.
 //!
-//! The frontend accepts only an already validated [`BridgePlan`] and a
-//! structured Rust call plan.  It performs no component discovery and has no
-//! process or filesystem inputs.  Raw operation callbacks stay private; the
-//! generated module registers one backend factory containing a dense function
-//! table.
+//! The frontend accepts an engine-owned family plan and a structured Rust call
+//! plan. It performs no component discovery and has no process or filesystem
+//! inputs. Raw operation callbacks stay private; the generated module
+//! registers one backend factory containing a dense function table.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -15,19 +14,15 @@ use std::ptr;
 use napi::bindgen_prelude::{BigInt, ToNapiValue};
 use napi::{sys, Result as NapiResult};
 use napi_derive_backend::{NapiFn, NapiFnArg, NapiFnArgKind, NapiFnBuilder, TryToTokens};
+use napi_family_core::StreamDirection;
 use napi_family_core::{
-  BigIntWords, FamilyOperation, FamilyOperationTarget, FamilyPlan, FamilyPlanError, HostFlavor,
+  AsyncKind, BigIntWords, CallbackReentrancy, CallbackRetention, CallbackThreading,
+  CallbackUseSite, FamilyOperation, FamilyOperationTarget, FamilyPlan, FamilyPlanError, HostFlavor,
+  OperationKind, ResourceKind, ResourceOwnership, ValuePathSegment,
 };
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
 use syn::{Path, Type};
-use uniffi_js_abi::{
-  AsyncKind, OperationId, OperationKind, OperationOwner, Ownership, ScalarType, ValueType,
-};
-use uniffi_js_engine_schema::{
-  BridgePlan, CallbackReentrancy, CallbackRetention, CallbackThreading, StreamDirection,
-  ValuePathSegment,
-};
 
 pub use napi_family_core;
 mod session;
@@ -237,12 +232,12 @@ pub enum ArgumentBinding {
   ObjectLease {
     carrier_type: Type,
     lower: Path,
-    ownership: Ownership,
+    ownership: ResourceOwnership,
   },
   OutputStreamLease {
     carrier_type: Type,
     lower: Path,
-    ownership: Ownership,
+    ownership: ResourceOwnership,
   },
   CallbackProxy {
     rust_type: Type,
@@ -322,7 +317,7 @@ pub struct RustReceiverPlan {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RustOperationPlan {
-  pub operation_id: OperationId,
+  pub operation_id: u32,
   pub target: RustOperationTarget,
   pub receiver: Option<RustReceiverPlan>,
   pub arguments: Vec<RustArgumentPlan>,
@@ -351,60 +346,49 @@ pub struct RustBridgePlan {
 
 impl RustBridgePlan {
   pub fn build(
-    bridge: &BridgePlan,
+    family: &FamilyPlan,
     operations: Vec<RustOperationPlan>,
   ) -> Result<Self, EngineError> {
-    Self::build_with_resource_hooks(bridge, operations, RustResourceHooks::default())
+    Self::build_with_resource_hooks(family, operations, RustResourceHooks::default())
   }
 
   pub fn build_with_resource_hooks(
-    bridge: &BridgePlan,
+    family: &FamilyPlan,
     operations: Vec<RustOperationPlan>,
     resource_hooks: RustResourceHooks,
   ) -> Result<Self, EngineError> {
-    let type_kinds = bridge
-      .types()
-      .iter()
-      .map(|ty| (&ty.definition.source_key, &ty.definition.kind))
-      .collect::<BTreeMap<_, _>>();
     let mut by_id = BTreeMap::new();
     for operation in operations {
-      let id = operation.operation_id.index();
+      let id = operation.operation_id;
       if by_id.insert(id, operation).is_some() {
         return Err(EngineError::DuplicateRustOperation { id });
       }
     }
-    if by_id.len() != bridge.operations().len() {
+    if by_id.len() != family.operations().len() {
       return Err(EngineError::RustOperationCount {
-        expected: bridge.operations().len(),
+        expected: family.operations().len(),
         actual: by_id.len(),
       });
     }
 
     let mut validated = Vec::with_capacity(by_id.len());
-    for (expected, bridge_operation) in bridge.operations().iter().enumerate() {
-      let expected = u32::try_from(expected).map_err(|_| EngineError::TooManyOperations)?;
+    for family_operation in family.operations() {
+      let expected = family_operation.id;
       let Some(operation) = by_id.remove(&expected) else {
         return Err(EngineError::MissingRustOperation { id: expected });
       };
-      let signature = &bridge_operation.operation.definition.signature;
-      validate_operation_target(
-        &bridge_operation.operation.definition.source_key,
-        &operation,
-      )?;
+      validate_operation_target(family_operation, &operation)?;
       let is_native = matches!(operation.target, RustOperationTarget::Native { .. });
       if is_native {
-        if operation.arguments.len() != signature.arguments.len() {
+        if operation.arguments.len() != family_operation.argument_count {
           return Err(EngineError::ArgumentCount {
             operation_id: operation.operation_id,
-            expected: signature.arguments.len(),
+            expected: family_operation.argument_count,
             actual: operation.arguments.len(),
           });
         }
-        validate_receiver(
-          &bridge_operation.operation.definition.source_key,
-          &operation,
-        )?;
+        validate_receiver(family_operation, &operation)?;
+        validate_result_resource(family_operation, &operation)?;
       } else if operation.receiver.is_some() || !operation.arguments.is_empty() {
         return Err(EngineError::HostOperationHasRustBindings {
           operation_id: operation.operation_id,
@@ -424,45 +408,31 @@ impl RustBridgePlan {
         }
       }
       if is_native {
-        for (index, (argument, semantic)) in operation
-          .arguments
-          .iter()
-          .zip(&signature.arguments)
-          .enumerate()
-        {
-          validate_argument_binding(
-            operation.operation_id,
-            index,
-            &semantic.ty,
-            semantic.ownership,
-            &argument.binding,
-            &type_kinds,
-          )?;
-        }
-        validate_return_binding(
-          operation.operation_id,
-          signature.return_type.as_ref(),
-          &operation.return_binding,
-          &type_kinds,
-        )?;
-        match (&signature.throws, &operation.error_binding) {
-          (None, ErrorBinding::Infallible) | (Some(_), ErrorBinding::Descriptor { .. }) => {}
-          (Some(_), ErrorBinding::Infallible) => {
+        validate_structured_bindings(family_operation, &operation)?;
+        match (family_operation.fallible, &operation.error_binding) {
+          (false, ErrorBinding::Infallible) | (true, ErrorBinding::Descriptor { .. }) => {}
+          (true, ErrorBinding::Infallible) => {
             return Err(EngineError::MissingErrorDescriptor {
               operation_id: operation.operation_id,
             });
           }
-          (None, ErrorBinding::Descriptor { .. }) => {
+          (false, ErrorBinding::Descriptor { .. }) => {
             return Err(EngineError::UnexpectedErrorDescriptor {
               operation_id: operation.operation_id,
             });
           }
         }
+      } else if !matches!(operation.return_binding, ReturnBinding::Unit)
+        || !matches!(operation.error_binding, ErrorBinding::Infallible)
+      {
+        return Err(EngineError::HostOperationHasRustBindings {
+          operation_id: operation.operation_id,
+        });
       }
       validated.push(operation);
     }
 
-    validate_resource_hooks(bridge, &resource_hooks)?;
+    validate_resource_hooks(family, &resource_hooks)?;
     Ok(Self {
       operations: validated,
       resource_hooks,
@@ -479,31 +449,26 @@ impl RustBridgePlan {
 }
 
 fn validate_resource_hooks(
-  bridge: &BridgePlan,
+  family: &FamilyPlan,
   hooks: &RustResourceHooks,
 ) -> Result<(), EngineError> {
-  let needs_object = bridge.operations().iter().any(|operation| {
+  let needs_object = family.operations().iter().any(|operation| {
     operation
-      .required_capabilities
-      .contains(uniffi_js_engine_schema::Capability::ObjectLease)
-      || matches!(
-        operation.operation.definition.source_key.owner(),
-        OperationOwner::Object(_)
-      ) && matches!(
-        operation.operation.definition.source_key.kind(),
-        OperationKind::Method | OperationKind::Constructor
-      )
+      .receiver
+      .as_ref()
+      .is_some_and(|receiver| receiver.kind == ResourceKind::Object)
+      || operation.result.map(|resource| resource.kind) == Some(ResourceKind::Object)
   });
-  let needs_output = bridge.operations().iter().any(|operation| {
+  let needs_output = family.operations().iter().any(|operation| {
     operation
-      .required_capabilities
-      .contains(uniffi_js_engine_schema::Capability::OutputStream)
-      || matches!(
-        operation.operation.definition.source_key.kind(),
-        OperationKind::OutputStreamStart
-          | OperationKind::OutputStreamNext
-          | OperationKind::OutputStreamCancel
-      )
+      .receiver
+      .as_ref()
+      .is_some_and(|receiver| receiver.kind == ResourceKind::OutputStream)
+      || operation.result.map(|resource| resource.kind) == Some(ResourceKind::OutputStream)
+      || operation
+        .streams
+        .iter()
+        .any(|stream| stream.direction == StreamDirection::Output)
   });
   if needs_object && hooks.release_object.is_none() {
     return Err(EngineError::MissingResourceHook {
@@ -523,165 +488,80 @@ fn validate_resource_hooks(
   Ok(())
 }
 
-fn validate_argument_binding(
-  operation_id: OperationId,
-  argument: usize,
-  value: &ValueType,
-  ownership: Ownership,
-  binding: &ArgumentBinding,
-  type_kinds: &BTreeMap<&uniffi_js_abi::TypeSourceKey, &uniffi_js_abi::NamedTypeKind>,
+fn validate_structured_bindings(
+  family_operation: &FamilyOperation,
+  operation: &RustOperationPlan,
 ) -> Result<(), EngineError> {
-  let valid = match value {
-    ValueType::Scalar(ScalarType::I64) => matches!(binding, ArgumentBinding::I64BigInt),
-    ValueType::Scalar(ScalarType::U64) => matches!(binding, ArgumentBinding::U64BigInt),
-    ValueType::Scalar(
-      ScalarType::Bool
-      | ScalarType::I8
-      | ScalarType::U8
-      | ScalarType::I16
-      | ScalarType::U16
-      | ScalarType::I32
-      | ScalarType::U32
-      | ScalarType::F32
-      | ScalarType::F64
-      | ScalarType::String,
-    ) => matches!(
-      binding,
-      ArgumentBinding::Direct { .. } | ArgumentBinding::LowerWith { .. }
-    ),
-    ValueType::Named(key) => match type_kinds.get(key) {
-      Some(uniffi_js_abi::NamedTypeKind::Callback) => {
-        matches!(binding, ArgumentBinding::CallbackProxy { .. })
-      }
-      Some(uniffi_js_abi::NamedTypeKind::Object) => matches!(
-        binding,
-        ArgumentBinding::ObjectLease {
-          ownership: binding_ownership,
-          ..
-        } if *binding_ownership == ownership
-      ),
-      Some(_) => matches!(binding, ArgumentBinding::LowerWith { .. }),
-      None => false,
-    },
-    ValueType::InputStream(_) => matches!(binding, ArgumentBinding::InputStreamProxy { .. }),
-    ValueType::OutputStream(_) => false,
-    _ => matches!(binding, ArgumentBinding::LowerWith { .. }),
-  };
-  if valid {
-    Ok(())
-  } else {
-    Err(EngineError::InvalidArgumentBinding {
-      operation_id,
-      argument,
-      expected: binding_expectation(value),
-    })
+  for (index, argument) in operation.arguments.iter().enumerate() {
+    let callback_path = family_operation.callbacks.iter().any(|use_site| {
+      matches!(
+        use_site.path.segments(),
+        [ValuePathSegment::Argument(argument_index)]
+          if *argument_index as usize == index
+      )
+    });
+    if callback_path && !matches!(argument.binding, ArgumentBinding::CallbackProxy { .. }) {
+      return Err(EngineError::InvalidStructuredBinding {
+        operation_id: operation.operation_id,
+        argument: index,
+        role: "callback",
+      });
+    }
+    let input_stream_path = family_operation.streams.iter().any(|use_site| {
+      use_site.direction == StreamDirection::Input
+        && matches!(
+          use_site.path.segments(),
+          [ValuePathSegment::Argument(argument_index)]
+            if *argument_index as usize == index
+        )
+    });
+    if input_stream_path && !matches!(argument.binding, ArgumentBinding::InputStreamProxy { .. }) {
+      return Err(EngineError::InvalidStructuredBinding {
+        operation_id: operation.operation_id,
+        argument: index,
+        role: "input stream",
+      });
+    }
   }
-}
-
-fn validate_return_binding(
-  operation_id: OperationId,
-  value: Option<&ValueType>,
-  binding: &ReturnBinding,
-  type_kinds: &BTreeMap<&uniffi_js_abi::TypeSourceKey, &uniffi_js_abi::NamedTypeKind>,
-) -> Result<(), EngineError> {
-  let valid = match value {
-    None => matches!(binding, ReturnBinding::Unit),
-    Some(ValueType::Scalar(ScalarType::I64)) => matches!(binding, ReturnBinding::I64BigInt),
-    Some(ValueType::Scalar(ScalarType::U64)) => matches!(binding, ReturnBinding::U64BigInt),
-    Some(ValueType::Scalar(
-      ScalarType::Bool
-      | ScalarType::I8
-      | ScalarType::U8
-      | ScalarType::I16
-      | ScalarType::U16
-      | ScalarType::I32
-      | ScalarType::U32
-      | ScalarType::F32
-      | ScalarType::F64
-      | ScalarType::String,
-    )) => matches!(
-      binding,
-      ReturnBinding::Direct { .. } | ReturnBinding::LiftWith { .. }
-    ),
-    Some(ValueType::Named(key)) => match type_kinds.get(key) {
-      Some(uniffi_js_abi::NamedTypeKind::Object) => {
-        matches!(binding, ReturnBinding::ObjectLease { .. })
-      }
-      Some(uniffi_js_abi::NamedTypeKind::Callback) => {
-        matches!(binding, ReturnBinding::CallbackLease { .. })
-      }
-      Some(_) => matches!(binding, ReturnBinding::LiftWith { .. }),
-      None => false,
-    },
-    Some(ValueType::OutputStream(_)) => matches!(binding, ReturnBinding::OutputStreamLease { .. }),
-    Some(_) => matches!(binding, ReturnBinding::LiftWith { .. }),
-  };
-  if valid {
-    Ok(())
-  } else {
-    Err(EngineError::InvalidReturnBinding {
-      operation_id,
-      expected: value.map_or("unit", binding_expectation),
-    })
-  }
+  Ok(())
 }
 
 fn validate_operation_target(
-  source: &uniffi_js_abi::OperationSourceKey,
+  family_operation: &FamilyOperation,
   operation: &RustOperationPlan,
 ) -> Result<(), EngineError> {
-  let valid = match source.kind() {
-    OperationKind::CallbackMethod => matches!(operation.target, RustOperationTarget::CallbackHost),
-    OperationKind::InputStreamPull => {
-      matches!(operation.target, RustOperationTarget::InputStreamHostPull)
+  let valid = match (family_operation.target, &operation.target) {
+    (FamilyOperationTarget::Native, RustOperationTarget::Native { .. }) => true,
+    (FamilyOperationTarget::CallbackHost { .. }, RustOperationTarget::CallbackHost) => true,
+    (FamilyOperationTarget::InputStreamHostPull, RustOperationTarget::InputStreamHostPull) => true,
+    (FamilyOperationTarget::InputStreamHostCancel, RustOperationTarget::InputStreamHostCancel) => {
+      true
     }
-    OperationKind::InputStreamCancel => {
-      matches!(operation.target, RustOperationTarget::InputStreamHostCancel)
-    }
-    _ => matches!(operation.target, RustOperationTarget::Native { .. }),
+    _ => false,
   };
   if valid {
     Ok(())
   } else {
     Err(EngineError::InvalidOperationTarget {
       operation_id: operation.operation_id,
-      kind: source.kind(),
+      kind: family_operation.kind,
     })
   }
 }
 
 fn validate_receiver(
-  source: &uniffi_js_abi::OperationSourceKey,
+  family_operation: &FamilyOperation,
   operation: &RustOperationPlan,
 ) -> Result<(), EngineError> {
-  let required = matches!(
-    (source.owner(), source.kind()),
-    (OperationOwner::Object(_), OperationKind::Method)
-      | (OperationOwner::Object(_), OperationKind::OutputStreamNext)
-      | (OperationOwner::Object(_), OperationKind::OutputStreamCancel)
-  );
-  match (required, &operation.receiver) {
-    (false, None) => Ok(()),
-    (true, Some(receiver)) => {
-      let valid = if matches!(
-        source.kind(),
-        OperationKind::OutputStreamNext | OperationKind::OutputStreamCancel
-      ) {
-        matches!(
-          receiver.binding,
-          ArgumentBinding::OutputStreamLease {
-            ownership: Ownership::Borrowed,
-            ..
-          }
-        )
-      } else {
-        matches!(
-          receiver.binding,
-          ArgumentBinding::ObjectLease {
-            ownership: Ownership::Borrowed,
-            ..
-          }
-        )
+  match (&family_operation.receiver, &operation.receiver) {
+    (None, None) => Ok(()),
+    (Some(expected), Some(actual)) => {
+      let valid = match (expected.kind, &actual.binding) {
+        (ResourceKind::Object, ArgumentBinding::ObjectLease { ownership, .. })
+        | (ResourceKind::OutputStream, ArgumentBinding::OutputStreamLease { ownership, .. }) => {
+          *ownership == expected.ownership
+        }
+        _ => false,
       };
       if valid {
         Ok(())
@@ -691,32 +571,38 @@ fn validate_receiver(
         })
       }
     }
-    (true, None) => Err(EngineError::MissingObjectReceiver {
+    (Some(_), None) => Err(EngineError::MissingObjectReceiver {
       operation_id: operation.operation_id,
     }),
-    (false, Some(_)) => Err(EngineError::UnexpectedObjectReceiver {
+    (None, Some(_)) => Err(EngineError::UnexpectedObjectReceiver {
       operation_id: operation.operation_id,
     }),
   }
 }
 
-fn binding_expectation(value: &ValueType) -> &'static str {
-  match value {
-    ValueType::Scalar(ScalarType::I64) => "lossless signed BigInt",
-    ValueType::Scalar(ScalarType::U64) => "lossless unsigned BigInt",
-    ValueType::Scalar(
-      ScalarType::Bool
-      | ScalarType::I8
-      | ScalarType::U8
-      | ScalarType::I16
-      | ScalarType::U16
-      | ScalarType::I32
-      | ScalarType::U32
-      | ScalarType::F32
-      | ScalarType::F64
-      | ScalarType::String,
-    ) => "direct N-API carrier or explicit adapter",
-    _ => "explicit carrier adapter",
+fn validate_result_resource(
+  family_operation: &FamilyOperation,
+  operation: &RustOperationPlan,
+) -> Result<(), EngineError> {
+  let valid = match family_operation.result.map(|resource| resource.kind) {
+    None => !matches!(
+      operation.return_binding,
+      ReturnBinding::ObjectLease { .. } | ReturnBinding::OutputStreamLease { .. }
+    ),
+    Some(ResourceKind::Object) => {
+      matches!(operation.return_binding, ReturnBinding::ObjectLease { .. })
+    }
+    Some(ResourceKind::OutputStream) => matches!(
+      operation.return_binding,
+      ReturnBinding::OutputStreamLease { .. }
+    ),
+  };
+  if valid {
+    Ok(())
+  } else {
+    Err(EngineError::InvalidResourceResult {
+      operation_id: operation.operation_id,
+    })
   }
 }
 
@@ -746,11 +632,9 @@ impl GeneratedNapiModule {
 }
 
 pub fn generate_napi_module(
-  bridge: &BridgePlan,
+  family: &FamilyPlan,
   rust: &RustBridgePlan,
-  flavor: HostFlavor,
 ) -> Result<GeneratedNapiModule, EngineError> {
-  let family = FamilyPlan::build(bridge, flavor)?;
   if family.operations().len() != rust.operations().len() {
     return Err(EngineError::RustOperationCount {
       expected: family.operations().len(),
@@ -765,8 +649,8 @@ pub fn generate_napi_module(
   for (family_operation, operation) in family.operations().iter().zip(rust.operations()) {
     if family_operation.id != operation.operation_id {
       return Err(EngineError::OperationOrder {
-        expected: family_operation.id.index(),
-        actual: operation.operation_id.index(),
+        expected: family_operation.id,
+        actual: operation.operation_id,
       });
     }
     if family_operation.target == FamilyOperationTarget::Native {
@@ -784,7 +668,7 @@ pub fn generate_napi_module(
   }
 
   let resource_callbacks = generate_resource_callbacks(rust.resource_hooks(), &mut source)?;
-  let factory = generate_factory(flavor, &family, &callbacks, &resource_callbacks)?;
+  let factory = generate_factory(family.flavor(), family, &callbacks, &resource_callbacks)?;
   source.extend(factory.body);
   factory
     .function
@@ -792,7 +676,7 @@ pub fn generate_napi_module(
     .map_err(|error| EngineError::BackendCodegen(format!("{error:?}")))?;
 
   Ok(GeneratedNapiModule {
-    family,
+    family: family.clone(),
     source,
     raw_operation_names,
   })
@@ -810,7 +694,7 @@ fn generate_operation(
   family: &FamilyOperation,
 ) -> Result<GeneratedOperation, EngineError> {
   let async_kind = family.async_kind;
-  let id = operation.operation_id.index();
+  let id = operation.operation_id;
   let function_name = format_ident!("__uniffi_raw_operation_{id}");
   let callback_factory = format_ident!("_napi_rs_internal_register___uniffi_raw_operation_{id}");
   let return_carrier = operation.return_binding.carrier_type();
@@ -923,7 +807,7 @@ fn generate_operation(
             argument: argument_index,
             role: "callback",
           })?;
-        let callback_type_id = callback.callback_type.index();
+        let callback_type_id = callback.callback_type_id;
         let contract = callback_contract_tokens(callback, argument_index as u32);
         lowerings.push(quote! {
           let #name = match #build(
@@ -939,7 +823,7 @@ fn generate_operation(
       }
       ArgumentBinding::InputStreamProxy { build, .. } => {
         let found = family.streams.iter().any(|use_site| {
-          use_site.contract.direction == StreamDirection::Input
+          use_site.direction == StreamDirection::Input
             && matches!(
               use_site.path.segments(),
               [ValuePathSegment::Argument(index)] if *index as usize == argument_index
@@ -1011,9 +895,9 @@ fn generate_operation(
     quote!(#name: #carrier_type)
   });
   let receiver_declaration = operation.receiver.iter().map(|receiver| {
-    let name = &receiver.name;
+    let receiver_name = &receiver.name;
     let carrier_type = receiver.binding.carrier_type();
-    quote!(#name: #carrier_type,)
+    quote!(#receiver_name: #carrier_type,)
   });
   let host_declaration =
     requires_host.then(|| quote!(__uniffi_host: napi::bindgen_prelude::Object<'static>,));
@@ -1041,11 +925,8 @@ fn generate_operation(
   })
 }
 
-fn callback_contract_tokens(
-  use_site: &napi_family_core::FamilyCallbackUseSite,
-  argument_index: u32,
-) -> TokenStream {
-  let callback_type_id = use_site.callback_type.index();
+fn callback_contract_tokens(use_site: &CallbackUseSite, argument_index: u32) -> TokenStream {
+  let callback_type_id = use_site.callback_type_id;
   let retention = match use_site.contract.retention {
     CallbackRetention::Scoped => quote!(napi_uniffi_engine::SessionCallbackRetention::Scoped),
     CallbackRetention::Retained => quote!(napi_uniffi_engine::SessionCallbackRetention::Retained),
@@ -1236,24 +1117,23 @@ fn session_descriptor(
       AsyncKind::Sync => quote!(napi_uniffi_engine::SessionOperationDispatch::NativeSync),
       AsyncKind::Async => quote!(napi_uniffi_engine::SessionOperationDispatch::NativeAsync),
     },
-    FamilyOperationTarget::CallbackHost(method) => {
-      let callback_type_id = method.callback_type.index();
-      let method_id = method.method_id;
-      match operation.async_kind {
-        AsyncKind::Sync => quote! {
-          napi_uniffi_engine::SessionOperationDispatch::CallbackHostSync {
-            callback_type_id: #callback_type_id,
-            method_id: #method_id,
-          }
-        },
-        AsyncKind::Async => quote! {
-          napi_uniffi_engine::SessionOperationDispatch::CallbackHostAsync {
-            callback_type_id: #callback_type_id,
-            method_id: #method_id,
-          }
-        },
-      }
-    }
+    FamilyOperationTarget::CallbackHost {
+      callback_type_id,
+      method_id,
+    } => match operation.async_kind {
+      AsyncKind::Sync => quote! {
+        napi_uniffi_engine::SessionOperationDispatch::CallbackHostSync {
+          callback_type_id: #callback_type_id,
+          method_id: #method_id,
+        }
+      },
+      AsyncKind::Async => quote! {
+        napi_uniffi_engine::SessionOperationDispatch::CallbackHostAsync {
+          callback_type_id: #callback_type_id,
+          method_id: #method_id,
+        }
+      },
+    },
     FamilyOperationTarget::InputStreamHostPull => {
       if operation.async_kind != AsyncKind::Async {
         return Err(EngineError::InvalidHostOperationSignature {
@@ -1290,8 +1170,7 @@ fn session_descriptor(
     Some(_)
       if matches!(
         operation.kind,
-        uniffi_js_abi::OperationKind::OutputStreamNext
-          | uniffi_js_abi::OperationKind::OutputStreamCancel
+        OperationKind::OutputStreamNext | OperationKind::OutputStreamCancel
       ) =>
     {
       quote! {
@@ -1304,7 +1183,7 @@ fn session_descriptor(
     && !operation
       .streams
       .iter()
-      .any(|use_site| use_site.contract.direction == StreamDirection::Input)
+      .any(|use_site| use_site.direction == StreamDirection::Input)
   {
     quote!(napi_uniffi_engine::SessionNativeCall::ArgumentsOnly)
   } else {
@@ -1321,7 +1200,7 @@ fn session_descriptor(
           path: use_site.path.to_string(),
         });
       };
-      let callback_type_id = use_site.callback_type.index();
+      let callback_type_id = use_site.callback_type_id;
       let retention = match use_site.contract.retention {
         CallbackRetention::Scoped => quote!(napi_uniffi_engine::SessionCallbackRetention::Scoped),
         CallbackRetention::Retained => {
@@ -1358,7 +1237,7 @@ fn session_descriptor(
   let stream_arguments = operation
     .streams
     .iter()
-    .filter_map(|use_site| match use_site.contract.direction {
+    .filter_map(|use_site| match use_site.direction {
       StreamDirection::Input => Some(use_site),
       StreamDirection::Output => None,
     })
@@ -1381,7 +1260,7 @@ fn session_descriptor(
   for use_site in operation
     .streams
     .iter()
-    .filter(|use_site| use_site.contract.direction == StreamDirection::Output)
+    .filter(|use_site| use_site.direction == StreamDirection::Output)
   {
     if !matches!(use_site.path.segments(), [ValuePathSegment::Return]) {
       return Err(EngineError::UnsupportedUseSite {
@@ -1419,52 +1298,60 @@ pub enum EngineError {
   },
   TooManyOperations,
   ArgumentCount {
-    operation_id: OperationId,
+    operation_id: u32,
     expected: usize,
     actual: usize,
   },
   DuplicateRustArgument {
-    operation_id: OperationId,
+    operation_id: u32,
     name: String,
   },
   InvalidArgumentBinding {
-    operation_id: OperationId,
+    operation_id: u32,
     argument: usize,
     expected: &'static str,
   },
+  InvalidStructuredBinding {
+    operation_id: u32,
+    argument: usize,
+    role: &'static str,
+  },
   InvalidReturnBinding {
-    operation_id: OperationId,
+    operation_id: u32,
     expected: &'static str,
   },
   MissingErrorDescriptor {
-    operation_id: OperationId,
+    operation_id: u32,
   },
   UnexpectedErrorDescriptor {
-    operation_id: OperationId,
+    operation_id: u32,
   },
   InvalidOperationTarget {
-    operation_id: OperationId,
+    operation_id: u32,
     kind: OperationKind,
   },
   HostOperationHasRustBindings {
-    operation_id: OperationId,
+    operation_id: u32,
   },
   MissingObjectReceiver {
-    operation_id: OperationId,
+    operation_id: u32,
   },
   UnexpectedObjectReceiver {
-    operation_id: OperationId,
+    operation_id: u32,
   },
   InvalidObjectReceiver {
-    operation_id: OperationId,
+    operation_id: u32,
+  },
+  InvalidResourceResult {
+    operation_id: u32,
   },
   MissingStructuredUseSite {
-    operation_id: OperationId,
+    operation_id: u32,
     argument: usize,
     role: &'static str,
   },
   UnexpectedHostOperationCodegen {
-    operation_id: OperationId,
+    operation_id: u32,
   },
   MissingResourceHook {
     role: &'static str,
@@ -1474,17 +1361,17 @@ pub enum EngineError {
     actual: u32,
   },
   MissingNativeCallback {
-    operation_id: OperationId,
+    operation_id: u32,
   },
   UnexpectedNativeCallback {
-    operation_id: OperationId,
+    operation_id: u32,
   },
   InvalidHostOperationSignature {
-    operation_id: OperationId,
+    operation_id: u32,
     reason: &'static str,
   },
   UnsupportedUseSite {
-    operation_id: OperationId,
+    operation_id: u32,
     role: &'static str,
     path: String,
   },
@@ -1522,6 +1409,14 @@ impl fmt::Display for EngineError {
         formatter,
         "operation {operation_id} argument {argument} requires {expected}"
       ),
+      Self::InvalidStructuredBinding {
+        operation_id,
+        argument,
+        role,
+      } => write!(
+        formatter,
+        "operation {operation_id} argument {argument} requires structured {role} binding"
+      ),
       Self::InvalidReturnBinding {
         operation_id,
         expected,
@@ -1558,6 +1453,10 @@ impl fmt::Display for EngineError {
       Self::InvalidObjectReceiver { operation_id } => write!(
         formatter,
         "object operation {operation_id} requires a borrowed structured object lease receiver"
+      ),
+      Self::InvalidResourceResult { operation_id } => write!(
+        formatter,
+        "operation {operation_id} has a return binding incompatible with its resource result"
       ),
       Self::MissingStructuredUseSite {
         operation_id,

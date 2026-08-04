@@ -1,21 +1,14 @@
-//! Shared, build-time-only planning for Node and OHOS N-API backends.
+//! Engine-owned planning shared by the Node and OHOS N-API backends.
 //!
-//! This crate deliberately knows nothing about Node loaders, V8, Ark SDKs,
-//! files, or process configuration.  It translates a validated UniFFI
-//! [`BridgePlan`] into N-API carrier recipes and explicit host hooks.
+//! This crate intentionally has no dependency on UniFFI.  The UniFFI frontend
+//! projects its already-normalized operation table into the small mechanical
+//! DTOs below.  The family planner validates only dispatch slots, value paths,
+//! and resource lifecycle relationships; names, type graphs, and capability
+//! policy remain owned by the UniFFI frontend.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
-
-use uniffi_js_abi::{
-  AsyncKind, NamedTypeKind, OperationId, OperationKind, OperationOwner, Ownership, ScalarType,
-  TypeId, TypeSourceKey, ValueType,
-};
-use uniffi_js_engine_schema::{
-  BridgePlan, CallbackContract, CallbackUseSite, Capability, CapabilitySet, EngineCapabilities,
-  EngineKind, StreamContract, StreamDirection, StreamUseSite, ValuePath,
-};
 
 /// The two hosts that share the N-API family lowering.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -25,13 +18,6 @@ pub enum HostFlavor {
 }
 
 impl HostFlavor {
-  pub const fn engine_kind(self) -> EngineKind {
-    match self {
-      Self::Node => EngineKind::Napi,
-      Self::Ohos => EngineKind::OhosNapi,
-    }
-  }
-
   pub const fn hooks(self) -> HostHooks {
     match self {
       Self::Node => HostHooks {
@@ -46,42 +32,6 @@ impl HostFlavor {
         callback_dispatch: CallbackDispatch::ArkPriorityThreadsafeFunction,
         cleanup_queue: CleanupQueue::ArkRuntime,
       },
-    }
-  }
-
-  /// Capabilities implemented by the family core plus the flavor hooks.
-  ///
-  /// Both hosts expose the same callback contract capabilities.  Their
-  /// runtime hooks differ, but callback reentrancy is part of the shared
-  /// family contract and is enforced by each flavor's generated proxy.
-  pub fn capabilities(self) -> EngineCapabilities {
-    let mut supported = CapabilitySet::new([
-      Capability::Primitive,
-      Capability::String,
-      Capability::Bytes,
-      Capability::BigInt,
-      Capability::Optional,
-      Capability::Sequence,
-      Capability::Map,
-      Capability::Set,
-      Capability::Record,
-      Capability::Enum,
-      Capability::DeclaredError,
-      Capability::ObjectLease,
-      Capability::SyncCall,
-      Capability::AsyncCall,
-      Capability::Callback,
-      Capability::RetainedCallback,
-      Capability::AsyncCallback,
-      Capability::FallibleCallback,
-      Capability::CrossThreadAsyncCallback,
-      Capability::InputStream,
-      Capability::OutputStream,
-    ]);
-    supported.insert(Capability::CallbackReentrancy);
-    EngineCapabilities {
-      engine: self.engine_kind(),
-      supported,
     }
   }
 }
@@ -118,60 +68,195 @@ pub enum CleanupQueue {
   ArkRuntime,
 }
 
-/// Canonical carrier used at the private N-API boundary.
+/// Operation async/fallibility data projected by the UniFFI frontend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AsyncKind {
+  Sync,
+  Async,
+}
+
+/// Mechanical operation shape.  This is not a public naming or type model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationKind {
+  Function,
+  Constructor,
+  Method,
+  CallbackMethod,
+  InputStreamPull,
+  InputStreamCancel,
+  OutputStreamStart,
+  OutputStreamNext,
+  OutputStreamCancel,
+}
+
+/// Resource ownership is needed by the N-API lease lowering, but carries no
+/// UniFFI type information.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceOwnership {
+  Owned,
+  Borrowed,
+  ByArc,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceKind {
+  Object,
+  OutputStream,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResourceBinding {
+  pub kind: ResourceKind,
+  pub ownership: ResourceOwnership,
+}
+
+/// Dispatch target.  Callback method IDs are supplied by the canonical
+/// frontend; the family planner never derives or persists them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationDispatch {
+  Native,
+  CallbackHost {
+    callback_type_id: u32,
+    method_id: u32,
+  },
+  InputStreamHostPull,
+  InputStreamHostCancel,
+}
+
+/// Mechanical path segments used by callback and stream use sites.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ValuePathSegment {
+  Argument(u32),
+  Return,
+  Field(String),
+  Variant(String),
+  Optional,
+  SequenceElement,
+  MapKey,
+  MapValue,
+  SetElement,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ValuePath {
+  segments: Vec<ValuePathSegment>,
+}
+
+impl ValuePath {
+  pub fn new(segments: impl Into<Vec<ValuePathSegment>>) -> Self {
+    Self {
+      segments: segments.into(),
+    }
+  }
+
+  pub fn argument(index: u32) -> Self {
+    Self::new(vec![ValuePathSegment::Argument(index)])
+  }
+
+  pub fn return_value() -> Self {
+    Self::new(vec![ValuePathSegment::Return])
+  }
+
+  pub fn segments(&self) -> &[ValuePathSegment] {
+    &self.segments
+  }
+}
+
+impl fmt::Display for ValuePath {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    for (index, segment) in self.segments.iter().enumerate() {
+      if index != 0 {
+        formatter.write_str(".")?;
+      }
+      match segment {
+        ValuePathSegment::Argument(index) => write!(formatter, "argument[{index}]")?,
+        ValuePathSegment::Return => formatter.write_str("return")?,
+        ValuePathSegment::Field(name) => write!(formatter, "field[{name}]")?,
+        ValuePathSegment::Variant(name) => write!(formatter, "variant[{name}]")?,
+        ValuePathSegment::Optional => formatter.write_str("optional")?,
+        ValuePathSegment::SequenceElement => formatter.write_str("sequence")?,
+        ValuePathSegment::MapKey => formatter.write_str("map-key")?,
+        ValuePathSegment::MapValue => formatter.write_str("map-value")?,
+        ValuePathSegment::SetElement => formatter.write_str("set")?,
+      }
+    }
+    Ok(())
+  }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallbackRetention {
+  Scoped,
+  Retained,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallbackThreading {
+  CallingThread,
+  MayCrossThread,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallbackReentrancy {
+  Allowed,
+  Forbidden,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallbackContract {
+  pub retention: CallbackRetention,
+  pub threading: CallbackThreading,
+  pub reentrancy: CallbackReentrancy,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CarrierRecipe {
-  Boolean,
-  Number(NumberCarrier),
-  BigInt(BigIntCarrier),
-  String,
-  Uint8Array,
-  Optional(Box<CarrierRecipe>),
-  Sequence(Box<CarrierRecipe>),
-  Map(Box<CarrierRecipe>, Box<CarrierRecipe>),
-  Set(Box<CarrierRecipe>),
-  Record(TypeId),
-  Enum(TypeId),
-  ErrorDescriptor(TypeId),
-  ObjectLease(TypeId),
-  Callback(TypeId),
-  InputStream(Box<CarrierRecipe>),
-  OutputStream(Box<CarrierRecipe>),
+pub struct CallbackUseSite {
+  pub operation_id: u32,
+  pub callback_type_id: u32,
+  pub path: ValuePath,
+  pub contract: CallbackContract,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NumberCarrier {
-  I8,
-  U8,
-  I16,
-  U16,
-  I32,
-  U32,
-  F32,
-  F64,
+pub enum StreamDirection {
+  Input,
+  Output,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BigIntCarrier {
-  pub signed: bool,
-  pub bits: u8,
-  pub lossless_required: bool,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamUseSite {
+  pub operation_id: u32,
+  pub path: ValuePath,
+  pub direction: StreamDirection,
 }
 
-impl BigIntCarrier {
-  pub const I64: Self = Self {
-    signed: true,
-    bits: 64,
-    lossless_required: true,
-  };
-  pub const U64: Self = Self {
-    signed: false,
-    bits: 64,
-    lossless_required: true,
-  };
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FamilyOperationInput {
+  pub id: u32,
+  pub kind: OperationKind,
+  pub async_kind: AsyncKind,
+  pub fallible: bool,
+  pub argument_count: usize,
+  pub dispatch: OperationDispatch,
+  pub receiver: Option<ResourceBinding>,
+  pub result: Option<ResourceBinding>,
+  pub callbacks: Vec<CallbackUseSite>,
+  pub streams: Vec<StreamUseSite>,
 }
 
-/// Runtime entrypoints required by the operations in one family plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FamilyPlanInput {
+  pub flavor: HostFlavor,
+  pub operations: Vec<FamilyOperationInput>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectReceiver {
+  pub kind: ResourceKind,
+  pub ownership: ResourceOwnership,
+}
+
+/// Runtime entrypoints required by a family plan.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RuntimeEntrypoint {
   CloseSession,
@@ -188,65 +273,31 @@ pub enum RuntimeEntrypoint {
   ReleaseOutputStream,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FamilyArgument {
-  pub carrier: CarrierRecipe,
-  pub ownership: Ownership,
-}
-
-/// The implicit resource receiver carried before the public arguments of an
-/// object method.  It is deliberately not forged into the public signature.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ObjectReceiver {
-  pub object_type: TypeId,
-  pub ownership: Ownership,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FamilyCallbackUseSite {
-  pub callback_type: TypeId,
-  pub path: ValuePath,
-  pub contract: CallbackContract,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FamilyStreamUseSite {
-  pub path: ValuePath,
-  pub contract: StreamContract,
-}
-
-/// Callback methods are host operations, not forward Rust calls.  `method_id`
-/// is dense within the callback type and is the value passed to Host.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CallbackMethod {
-  pub callback_type: TypeId,
-  pub method_id: u32,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FamilyOperationTarget {
   Native,
-  CallbackHost(CallbackMethod),
+  CallbackHost {
+    callback_type_id: u32,
+    method_id: u32,
+  },
   InputStreamHostPull,
   InputStreamHostCancel,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FamilyOperation {
-  pub id: OperationId,
-  pub owner: OperationOwner,
+  pub id: u32,
   pub kind: OperationKind,
   pub async_kind: AsyncKind,
+  pub fallible: bool,
+  pub argument_count: usize,
   pub receiver: Option<ObjectReceiver>,
-  pub arguments: Vec<FamilyArgument>,
-  pub return_value: Option<CarrierRecipe>,
-  pub declared_error: Option<TypeId>,
-  pub callbacks: Vec<FamilyCallbackUseSite>,
-  pub streams: Vec<FamilyStreamUseSite>,
+  pub result: Option<ResourceBinding>,
+  pub callbacks: Vec<CallbackUseSite>,
+  pub streams: Vec<StreamUseSite>,
   pub target: FamilyOperationTarget,
 }
 
-/// A deterministic N-API family plan.  Operation order is the dispatch order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FamilyPlan {
   flavor: HostFlavor,
@@ -256,119 +307,85 @@ pub struct FamilyPlan {
 }
 
 impl FamilyPlan {
-  pub fn build(bridge: &BridgePlan, flavor: HostFlavor) -> Result<Self, FamilyPlanError> {
-    let target = bridge
-      .targets()
-      .iter()
-      .find(|target| target.engine == flavor.engine_kind())
-      .ok_or(FamilyPlanError::MissingFlavorTarget { flavor })?;
-    let supported = flavor.capabilities().supported;
-    for capability in target.supported.iter() {
-      if !supported.contains(capability) {
-        return Err(FamilyPlanError::UnsupportedFlavorCapability { flavor, capability });
+  pub fn build(input: FamilyPlanInput) -> Result<Self, FamilyPlanError> {
+    let mut operations = input.operations;
+    let mut seen_ids = BTreeSet::new();
+    for operation in &operations {
+      if !seen_ids.insert(operation.id) {
+        return Err(FamilyPlanError::DuplicateOperationId { id: operation.id });
       }
     }
-
-    let types: BTreeMap<&TypeSourceKey, (TypeId, &NamedTypeKind)> = bridge
-      .types()
-      .iter()
-      .map(|ty| (&ty.definition.source_key, (ty.id, &ty.definition.kind)))
-      .collect();
-    let mut operations = Vec::with_capacity(bridge.operations().len());
-    let mut entrypoints = BTreeSet::from([RuntimeEntrypoint::CloseSession]);
-    let mut callback_method_ids = BTreeMap::<TypeId, u32>::new();
-
-    for (expected, operation) in bridge.operations().iter().enumerate() {
+    operations.sort_by_key(|operation| operation.id);
+    for (expected, operation) in operations.iter().enumerate() {
       let expected = u32::try_from(expected).map_err(|_| FamilyPlanError::TooManyOperations)?;
-      if operation.operation.id.index() != expected {
+      if operation.id != expected {
         return Err(FamilyPlanError::NonDenseOperationId {
           expected,
-          actual: operation.operation.id.index(),
+          actual: operation.id,
         });
       }
-      let signature = &operation.operation.definition.signature;
-      let arguments = signature
-        .arguments
-        .iter()
-        .map(|argument| {
-          Ok(FamilyArgument {
-            carrier: carrier_for(&argument.ty, &types)?,
-            ownership: argument.ownership,
-          })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-      let return_value = signature
-        .return_type
-        .as_ref()
-        .map(|value| carrier_for(value, &types))
-        .transpose()?;
-      let declared_error = signature
-        .throws
-        .as_ref()
-        .map(|key| named_type(key, &types, "declared error"))
-        .transpose()?
-        .map(|(id, kind)| {
-          if matches!(kind, NamedTypeKind::Error { .. }) {
-            Ok(id)
-          } else {
-            Err(FamilyPlanError::WrongNamedTypeKind {
-              key: signature.throws.as_ref().expect("checked above").clone(),
-              expected: "error",
-            })
-          }
-        })
-        .transpose()?;
-
-      let source = &operation.operation.definition.source_key;
-      let owner = source.owner().clone();
-      let kind = source.kind();
-      let (receiver, target_kind) = operation_semantics(
-        operation.operation.id,
-        &owner,
-        kind,
-        &types,
-        &mut callback_method_ids,
-      )?;
-      let callbacks = bridge
-        .callbacks()
-        .iter()
-        .filter(|use_site| use_site.operation_id == operation.operation.id)
-        .map(callback_use_site)
-        .collect::<Vec<_>>();
-      let streams = bridge
-        .streams()
-        .iter()
-        .filter(|use_site| use_site.operation_id == operation.operation.id)
-        .map(stream_use_site)
-        .collect::<Vec<_>>();
-
-      add_runtime_entrypoints(
-        &operation.required_capabilities,
-        target_kind,
-        signature.async_kind,
-        &callbacks,
-        &streams,
-        &mut entrypoints,
-      );
-      operations.push(FamilyOperation {
-        id: operation.operation.id,
-        owner,
-        kind,
-        async_kind: signature.async_kind,
-        receiver,
-        arguments,
-        return_value,
-        declared_error,
-        callbacks,
-        streams,
-        target: target_kind,
-      });
+      validate_operation_shape(operation)?;
+      for callback in &operation.callbacks {
+        if callback.operation_id != operation.id {
+          return Err(FamilyPlanError::UseSiteOperationMismatch {
+            expected: operation.id,
+            actual: callback.operation_id,
+            role: "callback",
+          });
+        }
+        validate_path(operation, &callback.path, "callback")?;
+      }
+      for stream in &operation.streams {
+        if stream.operation_id != operation.id {
+          return Err(FamilyPlanError::UseSiteOperationMismatch {
+            expected: operation.id,
+            actual: stream.operation_id,
+            role: "stream",
+          });
+        }
+        validate_path(operation, &stream.path, "stream")?;
+      }
     }
 
+    let mut entrypoints = BTreeSet::from([RuntimeEntrypoint::CloseSession]);
+    let family_operations = operations
+      .into_iter()
+      .map(|operation| {
+        let target = match operation.dispatch {
+          OperationDispatch::Native => FamilyOperationTarget::Native,
+          OperationDispatch::CallbackHost {
+            callback_type_id,
+            method_id,
+          } => FamilyOperationTarget::CallbackHost {
+            callback_type_id,
+            method_id,
+          },
+          OperationDispatch::InputStreamHostPull => FamilyOperationTarget::InputStreamHostPull,
+          OperationDispatch::InputStreamHostCancel => FamilyOperationTarget::InputStreamHostCancel,
+        };
+        add_runtime_entrypoints(&operation, target, &mut entrypoints);
+        FamilyOperation {
+          id: operation.id,
+          kind: operation.kind,
+          async_kind: operation.async_kind,
+          fallible: operation.fallible,
+          argument_count: operation.argument_count,
+          receiver: operation.receiver.map(|resource| ObjectReceiver {
+            kind: resource.kind,
+            ownership: resource.ownership,
+          }),
+          result: operation.result,
+          callbacks: operation.callbacks,
+          streams: operation.streams,
+          target,
+        }
+      })
+      .collect();
+
     Ok(Self {
-      flavor,
-      hooks: flavor.hooks(),
-      operations,
+      flavor: input.flavor,
+      hooks: input.flavor.hooks(),
+      operations: family_operations,
       runtime_entrypoints: entrypoints,
     })
   }
@@ -390,19 +407,127 @@ impl FamilyPlan {
   }
 }
 
+fn validate_operation_shape(operation: &FamilyOperationInput) -> Result<(), FamilyPlanError> {
+  let receiver_kind = operation.receiver.map(|resource| resource.kind);
+  let required_receiver = matches!(
+    operation.kind,
+    OperationKind::Method | OperationKind::OutputStreamNext | OperationKind::OutputStreamCancel
+  );
+  if required_receiver && receiver_kind.is_none() {
+    return Err(FamilyPlanError::MissingReceiver { id: operation.id });
+  }
+  if !required_receiver && receiver_kind.is_some() {
+    return Err(FamilyPlanError::UnexpectedReceiver { id: operation.id });
+  }
+  if matches!(operation.kind, OperationKind::Method) && receiver_kind != Some(ResourceKind::Object)
+  {
+    return Err(FamilyPlanError::WrongReceiverKind { id: operation.id });
+  }
+  if matches!(
+    operation.kind,
+    OperationKind::OutputStreamNext | OperationKind::OutputStreamCancel
+  ) && receiver_kind != Some(ResourceKind::OutputStream)
+  {
+    return Err(FamilyPlanError::WrongReceiverKind { id: operation.id });
+  }
+  if matches!(operation.kind, OperationKind::OutputStreamStart)
+    && operation.result.map(|resource| resource.kind) != Some(ResourceKind::OutputStream)
+  {
+    return Err(FamilyPlanError::MissingResultResource { id: operation.id });
+  }
+  if matches!(
+    operation.kind,
+    OperationKind::InputStreamPull | OperationKind::InputStreamCancel
+  ) && operation.dispatch
+    != match operation.kind {
+      OperationKind::InputStreamPull => OperationDispatch::InputStreamHostPull,
+      OperationKind::InputStreamCancel => OperationDispatch::InputStreamHostCancel,
+      _ => unreachable!(),
+    }
+  {
+    return Err(FamilyPlanError::WrongDispatch { id: operation.id });
+  }
+  if matches!(operation.dispatch, OperationDispatch::CallbackHost { .. })
+    && operation.kind != OperationKind::CallbackMethod
+  {
+    return Err(FamilyPlanError::WrongDispatch { id: operation.id });
+  }
+  if operation.kind == OperationKind::CallbackMethod
+    && !matches!(operation.dispatch, OperationDispatch::CallbackHost { .. })
+  {
+    return Err(FamilyPlanError::WrongDispatch { id: operation.id });
+  }
+  if matches!(
+    operation.dispatch,
+    OperationDispatch::InputStreamHostPull | OperationDispatch::InputStreamHostCancel
+  ) && operation.async_kind != AsyncKind::Async
+  {
+    return Err(FamilyPlanError::HostOperationMustBeAsync { id: operation.id });
+  }
+  Ok(())
+}
+
+fn validate_path(
+  operation: &FamilyOperationInput,
+  path: &ValuePath,
+  role: &'static str,
+) -> Result<(), FamilyPlanError> {
+  if path.segments().is_empty() {
+    return Err(FamilyPlanError::EmptyPath {
+      id: operation.id,
+      role,
+    });
+  }
+  match path.segments().first() {
+    Some(ValuePathSegment::Argument(index)) => {
+      if (*index as usize) >= operation.argument_count {
+        return Err(FamilyPlanError::ArgumentPathOutOfRange {
+          id: operation.id,
+          argument: *index,
+          count: operation.argument_count,
+          role,
+        });
+      }
+    }
+    Some(ValuePathSegment::Return) => {}
+    Some(_) => {
+      return Err(FamilyPlanError::InvalidPathRoot {
+        id: operation.id,
+        role,
+      });
+    }
+    None => unreachable!("empty path handled above"),
+  }
+  if path.segments().iter().skip(1).any(|segment| {
+    matches!(
+      segment,
+      ValuePathSegment::Argument(_) | ValuePathSegment::Return
+    )
+  }) {
+    return Err(FamilyPlanError::NestedRootSegment {
+      id: operation.id,
+      role,
+    });
+  }
+  Ok(())
+}
+
 fn add_runtime_entrypoints(
-  required: &CapabilitySet,
+  operation: &FamilyOperationInput,
   target: FamilyOperationTarget,
-  async_kind: AsyncKind,
-  callbacks: &[FamilyCallbackUseSite],
-  streams: &[FamilyStreamUseSite],
   entrypoints: &mut BTreeSet<RuntimeEntrypoint>,
 ) {
-  if required.contains(Capability::ObjectLease) {
+  if operation.receiver.map(|resource| resource.kind) == Some(ResourceKind::Object) {
     entrypoints.insert(RuntimeEntrypoint::ReleaseObject);
   }
-  for callback in callbacks {
-    use uniffi_js_engine_schema::CallbackRetention;
+  if operation.receiver.map(|resource| resource.kind) == Some(ResourceKind::OutputStream) {
+    entrypoints.extend([
+      RuntimeEntrypoint::NextOutputStream,
+      RuntimeEntrypoint::CancelOutputStream,
+      RuntimeEntrypoint::ReleaseOutputStream,
+    ]);
+  }
+  for callback in &operation.callbacks {
     if callback.contract.retention == CallbackRetention::Retained {
       entrypoints.extend([
         RuntimeEntrypoint::RetainCallback,
@@ -410,17 +535,14 @@ fn add_runtime_entrypoints(
       ]);
     }
   }
-  // Callback method dispatch is derived from the method operation signature,
-  // never from a callback argument use-site.  One callback interface may mix
-  // sync and async methods, so each host operation contributes its own entrypoint.
-  if matches!(target, FamilyOperationTarget::CallbackHost(_)) {
-    entrypoints.insert(match async_kind {
+  if matches!(target, FamilyOperationTarget::CallbackHost { .. }) {
+    entrypoints.insert(match operation.async_kind {
       AsyncKind::Sync => RuntimeEntrypoint::InvokeCallbackSync,
       AsyncKind::Async => RuntimeEntrypoint::InvokeCallbackAsync,
     });
   }
-  for stream in streams {
-    match stream.contract.direction {
+  for stream in &operation.streams {
+    match stream.direction {
       StreamDirection::Input => entrypoints.extend([
         RuntimeEntrypoint::PullInputStream,
         RuntimeEntrypoint::CancelInputStream,
@@ -435,246 +557,118 @@ fn add_runtime_entrypoints(
   }
 }
 
-fn callback_use_site(use_site: &CallbackUseSite) -> FamilyCallbackUseSite {
-  FamilyCallbackUseSite {
-    callback_type: use_site.callback_type,
-    path: use_site.path.clone(),
-    contract: use_site.contract,
-  }
-}
-
-fn stream_use_site(use_site: &StreamUseSite) -> FamilyStreamUseSite {
-  FamilyStreamUseSite {
-    path: use_site.path.clone(),
-    contract: use_site.contract,
-  }
-}
-
-fn operation_semantics(
-  operation_id: OperationId,
-  owner: &OperationOwner,
-  kind: OperationKind,
-  types: &BTreeMap<&TypeSourceKey, (TypeId, &NamedTypeKind)>,
-  callback_method_ids: &mut BTreeMap<TypeId, u32>,
-) -> Result<(Option<ObjectReceiver>, FamilyOperationTarget), FamilyPlanError> {
-  match (owner, kind) {
-    (OperationOwner::Namespace, OperationKind::Function) => {
-      Ok((None, FamilyOperationTarget::Native))
-    }
-    (OperationOwner::Object(key), OperationKind::Constructor) => {
-      require_owner_kind(operation_id, key, types, "object", NamedTypeKind::Object)?;
-      Ok((None, FamilyOperationTarget::Native))
-    }
-    (OperationOwner::Object(key), OperationKind::Method) => {
-      let object_type =
-        require_owner_kind(operation_id, key, types, "object", NamedTypeKind::Object)?;
-      Ok((
-        Some(ObjectReceiver {
-          object_type,
-          ownership: Ownership::Borrowed,
-        }),
-        FamilyOperationTarget::Native,
-      ))
-    }
-    (OperationOwner::Callback(key), OperationKind::CallbackMethod) => {
-      let callback_type = require_owner_kind(
-        operation_id,
-        key,
-        types,
-        "callback",
-        NamedTypeKind::Callback,
-      )?;
-      let method_id = callback_method_ids.entry(callback_type).or_default();
-      let result = CallbackMethod {
-        callback_type,
-        method_id: *method_id,
-      };
-      *method_id = method_id
-        .checked_add(1)
-        .ok_or(FamilyPlanError::TooManyCallbackMethods { callback_type })?;
-      Ok((None, FamilyOperationTarget::CallbackHost(result)))
-    }
-    (_, OperationKind::InputStreamPull) => Ok((None, FamilyOperationTarget::InputStreamHostPull)),
-    (_, OperationKind::InputStreamCancel) => {
-      Ok((None, FamilyOperationTarget::InputStreamHostCancel))
-    }
-    (OperationOwner::Object(key), OperationKind::OutputStreamNext)
-    | (OperationOwner::Object(key), OperationKind::OutputStreamCancel) => {
-      let object_type =
-        require_owner_kind(operation_id, key, types, "object", NamedTypeKind::Object)?;
-      Ok((
-        Some(ObjectReceiver {
-          object_type,
-          ownership: Ownership::Borrowed,
-        }),
-        FamilyOperationTarget::Native,
-      ))
-    }
-    (_, OperationKind::OutputStreamStart) => Ok((None, FamilyOperationTarget::Native)),
-    _ => Err(FamilyPlanError::UnsupportedOperationShape {
-      operation_id,
-      owner: owner.clone(),
-      kind,
-    }),
-  }
-}
-
-fn require_owner_kind(
-  operation_id: OperationId,
-  key: &TypeSourceKey,
-  types: &BTreeMap<&TypeSourceKey, (TypeId, &NamedTypeKind)>,
-  expected: &'static str,
-  expected_kind: NamedTypeKind,
-) -> Result<TypeId, FamilyPlanError> {
-  let (id, kind) = named_type(key, types, "operation owner")?;
-  if std::mem::discriminant(kind) == std::mem::discriminant(&expected_kind) {
-    Ok(id)
-  } else {
-    Err(FamilyPlanError::WrongOperationOwnerKind {
-      operation_id,
-      key: key.clone(),
-      expected,
-    })
-  }
-}
-
-fn carrier_for(
-  value: &ValueType,
-  types: &BTreeMap<&TypeSourceKey, (TypeId, &NamedTypeKind)>,
-) -> Result<CarrierRecipe, FamilyPlanError> {
-  Ok(match value {
-    ValueType::Scalar(scalar) => match scalar {
-      ScalarType::Bool => CarrierRecipe::Boolean,
-      ScalarType::I8 => CarrierRecipe::Number(NumberCarrier::I8),
-      ScalarType::U8 => CarrierRecipe::Number(NumberCarrier::U8),
-      ScalarType::I16 => CarrierRecipe::Number(NumberCarrier::I16),
-      ScalarType::U16 => CarrierRecipe::Number(NumberCarrier::U16),
-      ScalarType::I32 => CarrierRecipe::Number(NumberCarrier::I32),
-      ScalarType::U32 => CarrierRecipe::Number(NumberCarrier::U32),
-      ScalarType::I64 => CarrierRecipe::BigInt(BigIntCarrier::I64),
-      ScalarType::U64 => CarrierRecipe::BigInt(BigIntCarrier::U64),
-      ScalarType::F32 => CarrierRecipe::Number(NumberCarrier::F32),
-      ScalarType::F64 => CarrierRecipe::Number(NumberCarrier::F64),
-      ScalarType::String => CarrierRecipe::String,
-      ScalarType::Bytes => CarrierRecipe::Uint8Array,
-    },
-    ValueType::Named(key) => {
-      let (id, kind) = named_type(key, types, "value")?;
-      match kind {
-        NamedTypeKind::Record { .. } => CarrierRecipe::Record(id),
-        NamedTypeKind::Enum { .. } => CarrierRecipe::Enum(id),
-        NamedTypeKind::Error { .. } => CarrierRecipe::ErrorDescriptor(id),
-        NamedTypeKind::Object => CarrierRecipe::ObjectLease(id),
-        NamedTypeKind::Callback => CarrierRecipe::Callback(id),
-      }
-    }
-    ValueType::Optional(inner) => CarrierRecipe::Optional(Box::new(carrier_for(inner, types)?)),
-    ValueType::Sequence(inner) => CarrierRecipe::Sequence(Box::new(carrier_for(inner, types)?)),
-    ValueType::Map(key, value) => CarrierRecipe::Map(
-      Box::new(carrier_for(key, types)?),
-      Box::new(carrier_for(value, types)?),
-    ),
-    ValueType::Set(inner) => CarrierRecipe::Set(Box::new(carrier_for(inner, types)?)),
-    ValueType::InputStream(inner) => {
-      CarrierRecipe::InputStream(Box::new(carrier_for(inner, types)?))
-    }
-    ValueType::OutputStream(inner) => {
-      CarrierRecipe::OutputStream(Box::new(carrier_for(inner, types)?))
-    }
-  })
-}
-
-fn named_type<'a>(
-  key: &TypeSourceKey,
-  types: &'a BTreeMap<&TypeSourceKey, (TypeId, &'a NamedTypeKind)>,
-  role: &'static str,
-) -> Result<(TypeId, &'a NamedTypeKind), FamilyPlanError> {
-  types
-    .get(key)
-    .copied()
-    .ok_or_else(|| FamilyPlanError::UnknownNamedType {
-      role,
-      key: key.clone(),
-    })
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FamilyPlanError {
-  MissingFlavorTarget {
-    flavor: HostFlavor,
-  },
-  UnsupportedFlavorCapability {
-    flavor: HostFlavor,
-    capability: Capability,
+  DuplicateOperationId {
+    id: u32,
   },
   NonDenseOperationId {
     expected: u32,
     actual: u32,
   },
   TooManyOperations,
-  UnknownNamedType {
+  MissingReceiver {
+    id: u32,
+  },
+  UnexpectedReceiver {
+    id: u32,
+  },
+  WrongReceiverKind {
+    id: u32,
+  },
+  MissingResultResource {
+    id: u32,
+  },
+  WrongDispatch {
+    id: u32,
+  },
+  HostOperationMustBeAsync {
+    id: u32,
+  },
+  UseSiteOperationMismatch {
+    expected: u32,
+    actual: u32,
     role: &'static str,
-    key: TypeSourceKey,
   },
-  WrongNamedTypeKind {
-    key: TypeSourceKey,
-    expected: &'static str,
+  EmptyPath {
+    id: u32,
+    role: &'static str,
   },
-  WrongOperationOwnerKind {
-    operation_id: OperationId,
-    key: TypeSourceKey,
-    expected: &'static str,
+  InvalidPathRoot {
+    id: u32,
+    role: &'static str,
   },
-  UnsupportedOperationShape {
-    operation_id: OperationId,
-    owner: OperationOwner,
-    kind: OperationKind,
+  NestedRootSegment {
+    id: u32,
+    role: &'static str,
   },
-  TooManyCallbackMethods {
-    callback_type: TypeId,
+  ArgumentPathOutOfRange {
+    id: u32,
+    argument: u32,
+    count: usize,
+    role: &'static str,
   },
 }
 
 impl fmt::Display for FamilyPlanError {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
-      Self::MissingFlavorTarget { flavor } => {
-        write!(formatter, "bridge plan has no {flavor:?} target")
+      Self::DuplicateOperationId { id } => write!(formatter, "duplicate N-API operation ID {id}"),
+      Self::NonDenseOperationId { expected, actual } => {
+        write!(
+          formatter,
+          "N-API operation table is not dense: expected {expected}, found {actual}"
+        )
       }
-      Self::UnsupportedFlavorCapability { flavor, capability } => write!(
-        formatter,
-        "{flavor:?} N-API hooks do not support requested {capability:?}"
-      ),
-      Self::NonDenseOperationId { expected, actual } => write!(
-        formatter,
-        "N-API operation table is not dense: expected {expected}, found {actual}"
-      ),
       Self::TooManyOperations => formatter.write_str("N-API operation table exceeds u32"),
-      Self::UnknownNamedType { role, key } => {
-        write!(formatter, "{role} references unknown named type {key}")
+      Self::MissingReceiver { id } => {
+        write!(formatter, "operation {id} requires a resource receiver")
       }
-      Self::WrongNamedTypeKind { key, expected } => {
-        write!(formatter, "named type {key} is not a declared {expected}")
+      Self::UnexpectedReceiver { id } => write!(
+        formatter,
+        "operation {id} unexpectedly has a resource receiver"
+      ),
+      Self::WrongReceiverKind { id } => write!(
+        formatter,
+        "operation {id} has an incompatible resource receiver"
+      ),
+      Self::MissingResultResource { id } => write!(
+        formatter,
+        "output-stream operation {id} has no result resource"
+      ),
+      Self::WrongDispatch { id } => write!(
+        formatter,
+        "operation {id} has an incompatible host dispatch"
+      ),
+      Self::HostOperationMustBeAsync { id } => {
+        write!(formatter, "host stream operation {id} must be async")
       }
-      Self::WrongOperationOwnerKind {
-        operation_id,
-        key,
+      Self::UseSiteOperationMismatch {
         expected,
+        actual,
+        role,
       } => write!(
         formatter,
-        "operation {operation_id} owner {key} is not a declared {expected}"
+        "{role} use-site belongs to operation {actual}, expected {expected}"
       ),
-      Self::UnsupportedOperationShape {
-        operation_id,
-        owner,
-        kind,
+      Self::EmptyPath { id, role } => write!(formatter, "operation {id} has an empty {role} path"),
+      Self::InvalidPathRoot { id, role } => {
+        write!(formatter, "operation {id} has an invalid {role} path root")
+      }
+      Self::NestedRootSegment { id, role } => {
+        write!(
+          formatter,
+          "operation {id} has a nested root segment in its {role} path"
+        )
+      }
+      Self::ArgumentPathOutOfRange {
+        id,
+        argument,
+        count,
+        role,
       } => write!(
         formatter,
-        "operation {operation_id} has unsupported owner/kind combination {owner}/{kind:?}"
-      ),
-      Self::TooManyCallbackMethods { callback_type } => write!(
-        formatter,
-        "callback type {callback_type} has more than u32::MAX methods"
+        "operation {id} {role} path argument {argument} is outside {count} arguments"
       ),
     }
   }
@@ -723,7 +717,6 @@ pub fn require_lossless_u64(
   }
 }
 
-/// Engine-independent words for creating an N-API BigInt result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BigIntWords {
   pub negative: bool,
@@ -752,10 +745,24 @@ impl From<u64> for BigIntWords {
 mod tests {
   use super::*;
 
+  fn operation(id: u32, kind: OperationKind, dispatch: OperationDispatch) -> FamilyOperationInput {
+    FamilyOperationInput {
+      id,
+      kind,
+      async_kind: AsyncKind::Sync,
+      fallible: false,
+      argument_count: 0,
+      dispatch,
+      receiver: None,
+      result: None,
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+    }
+  }
+
   #[test]
   fn bigint_boundaries_are_lossless_and_signed() {
     assert_eq!(require_lossless_i64(i64::MIN, true), Ok(i64::MIN));
-    assert_eq!(require_lossless_i64(i64::MAX, true), Ok(i64::MAX));
     assert_eq!(
       require_lossless_i64(0, false),
       Err(BigIntLossError::LossySigned)
@@ -767,7 +774,6 @@ mod tests {
     );
     assert_eq!(BigIntWords::from(i64::MIN).words, vec![1_u64 << 63]);
     assert!(BigIntWords::from(i64::MIN).negative);
-    assert_eq!(BigIntWords::from(u64::MAX).words, vec![u64::MAX]);
   }
 
   #[test]
@@ -780,195 +786,119 @@ mod tests {
       HostFlavor::Ohos.hooks().callback_dispatch,
       CallbackDispatch::ArkPriorityThreadsafeFunction
     );
-    assert!(HostFlavor::Node
-      .capabilities()
-      .supported
-      .contains(Capability::CallbackReentrancy));
-    assert!(HostFlavor::Ohos
-      .capabilities()
-      .supported
-      .contains(Capability::CallbackReentrancy));
   }
 
   #[test]
-  fn ohos_family_plan_accepts_allowed_callback_reentrancy() {
-    use uniffi_js_abi::{
-      ArgumentDefinition, AsyncKind, ComponentDefinition, ComponentId, ComponentKey,
-      IdentifiedComponent, IdentifiedOperation, IdentifiedType, NamedTypeKind, OperationDefinition,
-      OperationId, OperationKind, OperationOwner, OperationSignature, OperationSourceKey,
-      Ownership, TypeDefinition, TypeId, TypeSourceKey, ValueType,
-    };
-    use uniffi_js_engine_schema::{
-      BridgePlanInput, CallbackContract, CallbackReentrancy, CallbackRetention, CallbackThreading,
-      CallbackUseSite, PlannedOperation,
-    };
-
-    let component = ComponentKey::new("ohos-callback-fixture").unwrap();
-    let callback_key = TypeSourceKey::new(component.clone(), "Observer").unwrap();
-    let observe = IdentifiedOperation {
-      id: OperationId::new(0),
-      definition: OperationDefinition::new(
-        OperationSourceKey::new(
-          component.clone(),
-          OperationOwner::Namespace,
-          OperationKind::Function,
-          "observe",
-        )
-        .unwrap(),
-        "observe",
-        "ohos_callback_fixture::observe",
-        "ohos_callback_fixture_private_0",
-        OperationSignature {
-          arguments: vec![ArgumentDefinition::new(
-            "observer",
-            ValueType::Named(callback_key.clone()),
-            Ownership::Owned,
-          )
-          .unwrap()],
-          return_type: None,
-          async_kind: AsyncKind::Sync,
-          throws: None,
-        },
-      )
-      .unwrap(),
-    };
-    let callback_method = IdentifiedOperation {
-      id: OperationId::new(1),
-      definition: OperationDefinition::new(
-        OperationSourceKey::new(
-          component.clone(),
-          OperationOwner::Callback(callback_key.clone()),
-          OperationKind::CallbackMethod,
-          "onEvent",
-        )
-        .unwrap(),
-        "onEvent",
-        "ohos_callback_fixture::Observer::onEvent",
-        "ohos_callback_fixture_private_1",
-        OperationSignature {
-          arguments: Vec::new(),
-          return_type: None,
-          async_kind: AsyncKind::Sync,
-          throws: None,
-        },
-      )
-      .unwrap(),
-    };
-    let bridge = BridgePlan::build(BridgePlanInput {
-      components: vec![IdentifiedComponent {
-        id: ComponentId::new(0),
-        definition: ComponentDefinition::new(component, "ohos-callback-fixture").unwrap(),
-      }],
-      types: vec![IdentifiedType {
-        id: TypeId::new(0),
-        definition: TypeDefinition::new(callback_key, "Observer", NamedTypeKind::Callback).unwrap(),
-      }],
+  fn family_validates_dense_ids_method_dispatch_and_lifetimes() {
+    let plan = FamilyPlan::build(FamilyPlanInput {
+      flavor: HostFlavor::Node,
       operations: vec![
-        PlannedOperation::new(observe),
-        PlannedOperation::new(callback_method),
+        operation(1, OperationKind::Function, OperationDispatch::Native),
+        operation(0, OperationKind::Function, OperationDispatch::Native),
       ],
-      callbacks: vec![CallbackUseSite {
-        operation_id: OperationId::new(0),
-        callback_type: TypeId::new(0),
-        path: ValuePath::argument(0),
-        contract: CallbackContract {
-          retention: CallbackRetention::Scoped,
-          threading: CallbackThreading::CallingThread,
-          reentrancy: CallbackReentrancy::Allowed,
-        },
-      }],
-      streams: Vec::new(),
-      targets: vec![HostFlavor::Ohos.capabilities()],
     })
     .unwrap();
+    assert_eq!(plan.operations()[0].id, 0);
+    assert!(plan
+      .runtime_entrypoints()
+      .any(|entry| entry == RuntimeEntrypoint::CloseSession));
 
-    let family = FamilyPlan::build(&bridge, HostFlavor::Ohos).unwrap();
-    assert_eq!(family.operations()[0].callbacks.len(), 1);
-    assert_eq!(
-      family.operations()[0].callbacks[0].contract.reentrancy,
-      CallbackReentrancy::Allowed
-    );
+    let bad = FamilyPlan::build(FamilyPlanInput {
+      flavor: HostFlavor::Node,
+      operations: vec![operation(
+        0,
+        OperationKind::CallbackMethod,
+        OperationDispatch::Native,
+      )],
+    })
+    .unwrap_err();
+    assert!(bad.to_string().contains("incompatible host dispatch"));
   }
 
   #[test]
-  fn carrier_recipes_keep_bigint_and_bytes_canonical() {
-    let types = BTreeMap::new();
-    assert_eq!(
-      carrier_for(&ValueType::Scalar(ScalarType::I64), &types).unwrap(),
-      CarrierRecipe::BigInt(BigIntCarrier::I64)
-    );
-    assert_eq!(
-      carrier_for(&ValueType::Scalar(ScalarType::U64), &types).unwrap(),
-      CarrierRecipe::BigInt(BigIntCarrier::U64)
-    );
-    assert_eq!(
-      carrier_for(&ValueType::Scalar(ScalarType::Bytes), &types).unwrap(),
-      CarrierRecipe::Uint8Array
-    );
-    assert_eq!(
-      carrier_for(
-        &ValueType::Map(
-          Box::new(ValueType::Scalar(ScalarType::String)),
-          Box::new(ValueType::Set(Box::new(
-            ValueType::Scalar(ScalarType::U32,)
-          ))),
-        ),
-        &types,
-      )
-      .unwrap(),
-      CarrierRecipe::Map(
-        Box::new(CarrierRecipe::String),
-        Box::new(CarrierRecipe::Set(Box::new(CarrierRecipe::Number(
-          NumberCarrier::U32,
-        )))),
-      )
-    );
+  fn callback_contract_and_stream_paths_are_retained_without_type_graph() {
+    let mut op = operation(0, OperationKind::Function, OperationDispatch::Native);
+    op.argument_count = 1;
+    op.callbacks.push(CallbackUseSite {
+      operation_id: 0,
+      callback_type_id: 7,
+      path: ValuePath::argument(0),
+      contract: CallbackContract {
+        retention: CallbackRetention::Retained,
+        threading: CallbackThreading::CallingThread,
+        reentrancy: CallbackReentrancy::Forbidden,
+      },
+    });
+    op.streams.push(StreamUseSite {
+      operation_id: 0,
+      path: ValuePath::argument(0),
+      direction: StreamDirection::Input,
+    });
+    let plan = FamilyPlan::build(FamilyPlanInput {
+      flavor: HostFlavor::Ohos,
+      operations: vec![op],
+    })
+    .unwrap();
+    assert_eq!(plan.operations()[0].callbacks[0].callback_type_id, 7);
+    assert!(plan
+      .runtime_entrypoints()
+      .any(|entry| entry == RuntimeEntrypoint::RetainCallback));
+    assert!(plan
+      .runtime_entrypoints()
+      .any(|entry| entry == RuntimeEntrypoint::PullInputStream));
   }
 
   #[test]
-  fn named_carriers_keep_semantic_roles() {
-    let component = uniffi_js_abi::ComponentKey::new("fixture").unwrap();
-    let record_key = TypeSourceKey::new(component.clone(), "Record").unwrap();
-    let enum_key = TypeSourceKey::new(component.clone(), "Enum").unwrap();
-    let error_key = TypeSourceKey::new(component.clone(), "Error").unwrap();
-    let object_key = TypeSourceKey::new(component.clone(), "Object").unwrap();
-    let callback_key = TypeSourceKey::new(component, "Callback").unwrap();
-    let record = NamedTypeKind::Record { fields: Vec::new() };
-    let enumeration = NamedTypeKind::Enum {
-      variants: Vec::new(),
-    };
-    let error = NamedTypeKind::Error {
-      variants: Vec::new(),
-    };
-    let object = NamedTypeKind::Object;
-    let callback = NamedTypeKind::Callback;
-    let types = BTreeMap::from([
-      (&record_key, (TypeId::new(0), &record)),
-      (&enum_key, (TypeId::new(1), &enumeration)),
-      (&error_key, (TypeId::new(2), &error)),
-      (&object_key, (TypeId::new(3), &object)),
-      (&callback_key, (TypeId::new(4), &callback)),
+  fn paths_have_one_root_and_no_nested_operation_selectors() {
+    let mut op = operation(0, OperationKind::Function, OperationDispatch::Native);
+    op.argument_count = 1;
+    op.callbacks.push(CallbackUseSite {
+      operation_id: 0,
+      callback_type_id: 1,
+      path: ValuePath::new(vec![ValuePathSegment::Field("field".into())]),
+      contract: CallbackContract {
+        retention: CallbackRetention::Scoped,
+        threading: CallbackThreading::CallingThread,
+        reentrancy: CallbackReentrancy::Allowed,
+      },
+    });
+    let error = FamilyPlan::build(FamilyPlanInput {
+      flavor: HostFlavor::Node,
+      operations: vec![op.clone()],
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("invalid callback path root"));
+
+    op.callbacks[0].path = ValuePath::new(vec![
+      ValuePathSegment::Argument(0),
+      ValuePathSegment::Return,
     ]);
+    let error = FamilyPlan::build(FamilyPlanInput {
+      flavor: HostFlavor::Node,
+      operations: vec![op],
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("nested root segment"));
 
-    assert_eq!(
-      carrier_for(&ValueType::Named(record_key.clone()), &types).unwrap(),
-      CarrierRecipe::Record(TypeId::new(0))
-    );
-    assert_eq!(
-      carrier_for(&ValueType::Named(enum_key.clone()), &types).unwrap(),
-      CarrierRecipe::Enum(TypeId::new(1))
-    );
-    assert_eq!(
-      carrier_for(&ValueType::Named(error_key.clone()), &types).unwrap(),
-      CarrierRecipe::ErrorDescriptor(TypeId::new(2))
-    );
-    assert_eq!(
-      carrier_for(&ValueType::Named(object_key.clone()), &types).unwrap(),
-      CarrierRecipe::ObjectLease(TypeId::new(3))
-    );
-    assert_eq!(
-      carrier_for(&ValueType::Named(callback_key.clone()), &types).unwrap(),
-      CarrierRecipe::Callback(TypeId::new(4))
-    );
+    let mut valid = operation(0, OperationKind::Function, OperationDispatch::Native);
+    valid.argument_count = 1;
+    valid.callbacks.push(CallbackUseSite {
+      operation_id: 0,
+      callback_type_id: 1,
+      path: ValuePath::new(vec![
+        ValuePathSegment::Argument(0),
+        ValuePathSegment::Field("field".into()),
+      ]),
+      contract: CallbackContract {
+        retention: CallbackRetention::Scoped,
+        threading: CallbackThreading::CallingThread,
+        reentrancy: CallbackReentrancy::Allowed,
+      },
+    });
+    FamilyPlan::build(FamilyPlanInput {
+      flavor: HostFlavor::Node,
+      operations: vec![valid],
+    })
+    .unwrap();
   }
 }

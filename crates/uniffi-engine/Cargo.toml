@@ -14,8 +14,6 @@ napi-family-core = { path = "../napi-family-core", version = "0.1.0" }
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["extra-traits", "full"] }
-uniffi_js_abi = { git = "https://github.com/EverglowStudio/uniffi-rs.git", rev = "4361fc73c10e36bdfc3fd0438ed63d9f2e130cd4", version = "=0.32.0" }
-uniffi_js_engine_schema = { git = "https://github.com/EverglowStudio/uniffi-rs.git", rev = "4361fc73c10e36bdfc3fd0438ed63d9f2e130cd4", version = "=0.32.0" }
 
 [lints]
 workspace = true
