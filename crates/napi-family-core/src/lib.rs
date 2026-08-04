@@ -344,6 +344,8 @@ impl FamilyPlan {
 
       add_runtime_entrypoints(
         &operation.required_capabilities,
+        target_kind,
+        signature.async_kind,
         &callbacks,
         &streams,
         &mut entrypoints,
@@ -390,6 +392,8 @@ impl FamilyPlan {
 
 fn add_runtime_entrypoints(
   required: &CapabilitySet,
+  target: FamilyOperationTarget,
+  async_kind: AsyncKind,
   callbacks: &[FamilyCallbackUseSite],
   streams: &[FamilyStreamUseSite],
   entrypoints: &mut BTreeSet<RuntimeEntrypoint>,
@@ -398,21 +402,22 @@ fn add_runtime_entrypoints(
     entrypoints.insert(RuntimeEntrypoint::ReleaseObject);
   }
   for callback in callbacks {
-    use uniffi_js_engine_schema::{CallbackCallStyle, CallbackRetention};
+    use uniffi_js_engine_schema::CallbackRetention;
     if callback.contract.retention == CallbackRetention::Retained {
       entrypoints.extend([
         RuntimeEntrypoint::RetainCallback,
         RuntimeEntrypoint::ReleaseCallback,
       ]);
     }
-    match callback.contract.call_style {
-      CallbackCallStyle::Sync => {
-        entrypoints.insert(RuntimeEntrypoint::InvokeCallbackSync);
-      }
-      CallbackCallStyle::Async => {
-        entrypoints.insert(RuntimeEntrypoint::InvokeCallbackAsync);
-      }
-    }
+  }
+  // Callback method dispatch is derived from the method operation signature,
+  // never from a callback argument use-site.  One callback interface may mix
+  // sync and async methods, so each host operation contributes its own entrypoint.
+  if matches!(target, FamilyOperationTarget::CallbackHost(_)) {
+    entrypoints.insert(match async_kind {
+      AsyncKind::Sync => RuntimeEntrypoint::InvokeCallbackSync,
+      AsyncKind::Async => RuntimeEntrypoint::InvokeCallbackAsync,
+    });
   }
   for stream in streams {
     match stream.contract.direction {
@@ -794,8 +799,8 @@ mod tests {
       Ownership, TypeDefinition, TypeId, TypeSourceKey, ValueType,
     };
     use uniffi_js_engine_schema::{
-      BridgePlanInput, CallbackCallStyle, CallbackContract, CallbackErrorStyle, CallbackReentrancy,
-      CallbackRetention, CallbackThreading, CallbackUseSite, PlannedOperation,
+      BridgePlanInput, CallbackContract, CallbackReentrancy, CallbackRetention, CallbackThreading,
+      CallbackUseSite, PlannedOperation,
     };
 
     let component = ComponentKey::new("ohos-callback-fixture").unwrap();
@@ -869,8 +874,6 @@ mod tests {
         contract: CallbackContract {
           retention: CallbackRetention::Scoped,
           threading: CallbackThreading::CallingThread,
-          call_style: CallbackCallStyle::Sync,
-          error_style: CallbackErrorStyle::Infallible,
           reentrancy: CallbackReentrancy::Allowed,
         },
       }],

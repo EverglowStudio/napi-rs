@@ -17,9 +17,8 @@ use uniffi_js_abi::{
   ScalarType, TypeDefinition, TypeId, TypeSourceKey, ValueType,
 };
 use uniffi_js_engine_schema::{
-  BridgePlan, BridgePlanInput, CallbackCallStyle, CallbackContract, CallbackErrorStyle,
-  CallbackReentrancy, CallbackRetention, CallbackThreading, CallbackUseSite, PlannedOperation,
-  StreamContract, StreamUseSite, ValuePath,
+  BridgePlan, BridgePlanInput, CallbackContract, CallbackReentrancy, CallbackRetention,
+  CallbackThreading, CallbackUseSite, PlannedOperation, StreamContract, StreamUseSite, ValuePath,
 };
 
 struct TempFixture(PathBuf);
@@ -79,6 +78,17 @@ fn operation_with_owner(
     )
     .unwrap(),
   })
+}
+
+fn host_operation(id: u32, target: RustOperationTarget) -> RustOperationPlan {
+  RustOperationPlan {
+    operation_id: OperationId::new(id),
+    target,
+    receiver: None,
+    arguments: Vec::new(),
+    return_binding: ReturnBinding::Unit,
+    error_binding: ErrorBinding::Infallible,
+  }
 }
 
 fn plan() -> (BridgePlan, RustBridgePlan) {
@@ -179,7 +189,7 @@ fn plan() -> (BridgePlan, RustBridgePlan) {
       operation_with_owner(
         &component,
         2,
-        OperationOwner::Callback(callback_key),
+        OperationOwner::Callback(callback_key.clone()),
         OperationKind::CallbackMethod,
         "onValue",
         vec![ArgumentDefinition::new(
@@ -190,6 +200,54 @@ fn plan() -> (BridgePlan, RustBridgePlan) {
         .unwrap()],
         Some(ValueType::Scalar(ScalarType::I64)),
         AsyncKind::Async,
+        Some(failure_key.clone()),
+      ),
+      operation_with_owner(
+        &component,
+        10,
+        OperationOwner::Callback(callback_key.clone()),
+        OperationKind::CallbackMethod,
+        "onSync",
+        vec![ArgumentDefinition::new(
+          "value",
+          ValueType::Scalar(ScalarType::I64),
+          Ownership::Owned,
+        )
+        .unwrap()],
+        Some(ValueType::Scalar(ScalarType::I64)),
+        AsyncKind::Sync,
+        None,
+      ),
+      operation_with_owner(
+        &component,
+        11,
+        OperationOwner::Callback(callback_key.clone()),
+        OperationKind::CallbackMethod,
+        "onAsync",
+        vec![ArgumentDefinition::new(
+          "value",
+          ValueType::Scalar(ScalarType::I64),
+          Ownership::Owned,
+        )
+        .unwrap()],
+        Some(ValueType::Scalar(ScalarType::I64)),
+        AsyncKind::Async,
+        None,
+      ),
+      operation_with_owner(
+        &component,
+        12,
+        OperationOwner::Callback(callback_key),
+        OperationKind::CallbackMethod,
+        "onSyncFailure",
+        vec![ArgumentDefinition::new(
+          "value",
+          ValueType::Scalar(ScalarType::I64),
+          Ownership::Owned,
+        )
+        .unwrap()],
+        Some(ValueType::Scalar(ScalarType::I64)),
+        AsyncKind::Sync,
         Some(failure_key),
       ),
       operation_with_owner(
@@ -257,9 +315,7 @@ fn plan() -> (BridgePlan, RustBridgePlan) {
       path: ValuePath::argument(0),
       contract: CallbackContract {
         retention: CallbackRetention::Retained,
-        threading: CallbackThreading::MayCrossThread,
-        call_style: CallbackCallStyle::Async,
-        error_style: CallbackErrorStyle::Fallible,
+        threading: CallbackThreading::CallingThread,
         reentrancy: CallbackReentrancy::Forbidden,
       },
     }],
@@ -378,6 +434,9 @@ fn plan() -> (BridgePlan, RustBridgePlan) {
         return_binding: ReturnBinding::Unit,
         error_binding: ErrorBinding::Infallible,
       },
+      host_operation(10, RustOperationTarget::CallbackHost),
+      host_operation(11, RustOperationTarget::CallbackHost),
+      host_operation(12, RustOperationTarget::CallbackHost),
       RustOperationPlan {
         operation_id: OperationId::new(3),
         target: RustOperationTarget::InputStreamHostPull,
@@ -576,9 +635,7 @@ mod fixture {{
     assert_eq!(callback_type_id, 0);
     assert_eq!(contract.callback_type_id, 0);
     assert_eq!(contract.retention, napi_uniffi_engine::SessionCallbackRetention::Retained);
-    assert_eq!(contract.threading, napi_uniffi_engine::SessionCallbackThreading::MayCrossThread);
-    assert_eq!(contract.call_style, napi_uniffi_engine::SessionCallbackCallStyle::Async);
-    assert_eq!(contract.error_style, napi_uniffi_engine::SessionCallbackErrorStyle::Fallible);
+    assert_eq!(contract.threading, napi_uniffi_engine::SessionCallbackThreading::CallingThread);
     assert_eq!(contract.reentrancy, napi_uniffi_engine::SessionCallbackReentrancy::Forbidden);
     Ok(callback_id)
   }}
@@ -644,8 +701,12 @@ const callbackCalls = [];
 const streamCalls = [];
 const lifecycleCalls = [];
 const host = {
+  invokeCallbackSync(callbackTypeId, callbackId, methodId, args) {
+    callbackCalls.push(['sync', callbackTypeId, callbackId, methodId, args]);
+    return args[0] + 5n;
+  },
   invokeCallbackAsync(callbackTypeId, callbackId, methodId, invocationId, args) {
-    callbackCalls.push([callbackTypeId, callbackId, methodId, invocationId, args]);
+    callbackCalls.push(['async', callbackTypeId, callbackId, methodId, invocationId, args]);
     return Promise.resolve(args[0] + 7n);
   },
   pullInputStream(streamId) {
@@ -675,7 +736,15 @@ assert.equal(session.invokeSync(0, []).value, 42n);
   assert.equal(result.kind, 'value');
   assert.equal(result.value, 42n);
   assert.equal(await session.invokeAsync(2, [7, 35n]), 42n);
-  assert.deepEqual(callbackCalls, [[0, 7, 0, 0, [35n]]]);
+  assert.equal(session.invokeSync(10, [7, 13n]), 18n);
+  assert.equal(await session.invokeAsync(11, [7, 31n]), 38n);
+  assert.equal(session.invokeSync(12, [7, 12n]), 17n);
+  assert.deepEqual(callbackCalls, [
+    ['async', 0, 7, 0, 0, [35n]],
+    ['sync', 0, 7, 1, [13n]],
+    ['async', 0, 7, 2, 1, [31n]],
+    ['sync', 0, 7, 3, [12n]],
+  ]);
   assert.equal(await session.invokeAsync(3, [9]), 10);
   await session.invokeAsync(4, [9]);
   assert.deepEqual(streamCalls, [['pull', 9], ['cancel', 9]]);

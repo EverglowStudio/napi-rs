@@ -12,9 +12,8 @@ use uniffi_js_abi::{
   OperationSourceKey, Ownership, ScalarType, TypeDefinition, TypeId, TypeSourceKey, ValueType,
 };
 use uniffi_js_engine_schema::{
-  BridgePlan, BridgePlanInput, CallbackCallStyle, CallbackContract, CallbackErrorStyle,
-  CallbackReentrancy, CallbackRetention, CallbackThreading, CallbackUseSite, PlannedOperation,
-  StreamContract, StreamUseSite, ValuePath,
+  BridgePlan, BridgePlanInput, CallbackContract, CallbackReentrancy, CallbackRetention,
+  CallbackThreading, CallbackUseSite, PlannedOperation, StreamContract, StreamUseSite, ValuePath,
 };
 
 fn ident(name: &str) -> Ident {
@@ -313,8 +312,6 @@ fn bridge(flavor: HostFlavor) -> BridgePlan {
       contract: CallbackContract {
         retention: CallbackRetention::Retained,
         threading: CallbackThreading::MayCrossThread,
-        call_style: CallbackCallStyle::Async,
-        error_style: CallbackErrorStyle::Fallible,
         reentrancy: CallbackReentrancy::Forbidden,
       },
     }],
@@ -563,19 +560,102 @@ fn exposes_object_callback_and_stream_runtime_hooks() {
     callback_use.contract.threading,
     CallbackThreading::MayCrossThread
   );
-  assert_eq!(callback_use.contract.call_style, CallbackCallStyle::Async);
-  assert_eq!(
-    callback_use.contract.error_style,
-    CallbackErrorStyle::Fallible
-  );
   assert_eq!(
     callback_use.contract.reentrancy,
     CallbackReentrancy::Forbidden
   );
+  assert_eq!(callback_method.async_kind, AsyncKind::Async);
+  assert_eq!(callback_method.declared_error, Some(TypeId::new(1)));
   assert!(generated
     .source()
     .to_string()
     .contains("SessionCallbackReentrancy :: Forbidden"));
+}
+
+#[test]
+fn callback_method_dispatch_uses_each_method_signature() {
+  let component = ComponentKey::new("mixed_callback_fixture").unwrap();
+  let callback_key = TypeSourceKey::new(component.clone(), "Observer").unwrap();
+  let failure_key = TypeSourceKey::new(component.clone(), "Failure").unwrap();
+  let methods = [
+    ("syncInfallible", AsyncKind::Sync, None),
+    ("syncFallible", AsyncKind::Sync, Some(failure_key.clone())),
+    ("asyncInfallible", AsyncKind::Async, None),
+    ("asyncFallible", AsyncKind::Async, Some(failure_key.clone())),
+  ];
+  let operations = methods
+    .iter()
+    .enumerate()
+    .map(|(id, (name, async_kind, throws))| {
+      operation(
+        &component,
+        id as u32,
+        OperationOwner::Callback(callback_key.clone()),
+        OperationKind::CallbackMethod,
+        name,
+        Vec::new(),
+        None,
+        *async_kind,
+        throws.clone(),
+      )
+    })
+    .collect();
+  let bridge = BridgePlan::build(BridgePlanInput {
+    components: vec![IdentifiedComponent {
+      id: ComponentId::new(0),
+      definition: ComponentDefinition::new(component, "mixedCallbackFixture").unwrap(),
+    }],
+    types: vec![
+      IdentifiedType {
+        id: TypeId::new(0),
+        definition: TypeDefinition::new(callback_key, "Observer", NamedTypeKind::Callback).unwrap(),
+      },
+      IdentifiedType {
+        id: TypeId::new(1),
+        definition: TypeDefinition::new(
+          failure_key,
+          "Failure",
+          NamedTypeKind::Error {
+            variants: Vec::new(),
+          },
+        )
+        .unwrap(),
+      },
+    ],
+    operations,
+    callbacks: Vec::new(),
+    streams: Vec::new(),
+    targets: vec![HostFlavor::Node.capabilities()],
+  })
+  .unwrap();
+
+  let family = napi_family_core::FamilyPlan::build(&bridge, HostFlavor::Node).unwrap();
+  let methods = family
+    .operations()
+    .iter()
+    .map(|operation| {
+      let napi_family_core::FamilyOperationTarget::CallbackHost(method) = operation.target else {
+        panic!("expected callback host operation")
+      };
+      (
+        method.method_id,
+        operation.async_kind,
+        operation.declared_error,
+      )
+    })
+    .collect::<Vec<_>>();
+  assert_eq!(
+    methods,
+    vec![
+      (0, AsyncKind::Sync, None),
+      (1, AsyncKind::Sync, Some(TypeId::new(1))),
+      (2, AsyncKind::Async, None),
+      (3, AsyncKind::Async, Some(TypeId::new(1))),
+    ]
+  );
+  let entrypoints = family.runtime_entrypoints().collect::<Vec<_>>();
+  assert!(entrypoints.contains(&RuntimeEntrypoint::InvokeCallbackSync));
+  assert!(entrypoints.contains(&RuntimeEntrypoint::InvokeCallbackAsync));
 }
 
 #[test]

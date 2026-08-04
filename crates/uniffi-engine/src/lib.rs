@@ -25,18 +25,17 @@ use uniffi_js_abi::{
   AsyncKind, OperationId, OperationKind, OperationOwner, Ownership, ScalarType, ValueType,
 };
 use uniffi_js_engine_schema::{
-  BridgePlan, CallbackCallStyle, CallbackErrorStyle, CallbackReentrancy, CallbackRetention,
-  CallbackThreading, StreamDirection, ValuePathSegment,
+  BridgePlan, CallbackReentrancy, CallbackRetention, CallbackThreading, StreamDirection,
+  ValuePathSegment,
 };
 
 pub use napi_family_core;
 mod session;
 pub use session::{
-  create_backend_session, SessionCallbackArgument, SessionCallbackCallStyle,
-  SessionCallbackErrorStyle, SessionCallbackReentrancy, SessionCallbackRetention,
-  SessionCallbackThreading, SessionNativeCall, SessionOperationDescriptor,
-  SessionOperationDispatch, SessionResourceCallbacks, SessionResourceReceiver,
-  SessionStreamArgument, SessionStreamDirection,
+  create_backend_session, SessionCallbackArgument, SessionCallbackReentrancy,
+  SessionCallbackRetention, SessionCallbackThreading, SessionNativeCall,
+  SessionOperationDescriptor, SessionOperationDispatch, SessionResourceCallbacks,
+  SessionResourceReceiver, SessionStreamArgument, SessionStreamDirection,
 };
 
 pub const BACKEND_FACTORY_EXPORT: &str = "__uniffi_backend_factory";
@@ -1059,18 +1058,6 @@ fn callback_contract_tokens(
       quote!(napi_uniffi_engine::SessionCallbackThreading::MayCrossThread)
     }
   };
-  let call_style = match use_site.contract.call_style {
-    CallbackCallStyle::Sync => quote!(napi_uniffi_engine::SessionCallbackCallStyle::Sync),
-    CallbackCallStyle::Async => quote!(napi_uniffi_engine::SessionCallbackCallStyle::Async),
-  };
-  let error_style = match use_site.contract.error_style {
-    CallbackErrorStyle::Infallible => {
-      quote!(napi_uniffi_engine::SessionCallbackErrorStyle::Infallible)
-    }
-    CallbackErrorStyle::Fallible => {
-      quote!(napi_uniffi_engine::SessionCallbackErrorStyle::Fallible)
-    }
-  };
   let reentrancy = match use_site.contract.reentrancy {
     CallbackReentrancy::Allowed => {
       quote!(napi_uniffi_engine::SessionCallbackReentrancy::Allowed)
@@ -1085,8 +1072,6 @@ fn callback_contract_tokens(
       callback_type_id: #callback_type_id,
       retention: #retention,
       threading: #threading,
-      call_style: #call_style,
-      error_style: #error_style,
       reentrancy: #reentrancy,
     }
   }
@@ -1351,18 +1336,6 @@ fn session_descriptor(
           quote!(napi_uniffi_engine::SessionCallbackThreading::MayCrossThread)
         }
       };
-      let call_style = match use_site.contract.call_style {
-        CallbackCallStyle::Sync => quote!(napi_uniffi_engine::SessionCallbackCallStyle::Sync),
-        CallbackCallStyle::Async => quote!(napi_uniffi_engine::SessionCallbackCallStyle::Async),
-      };
-      let error_style = match use_site.contract.error_style {
-        CallbackErrorStyle::Infallible => {
-          quote!(napi_uniffi_engine::SessionCallbackErrorStyle::Infallible)
-        }
-        CallbackErrorStyle::Fallible => {
-          quote!(napi_uniffi_engine::SessionCallbackErrorStyle::Fallible)
-        }
-      };
       let reentrancy = match use_site.contract.reentrancy {
         CallbackReentrancy::Allowed => {
           quote!(napi_uniffi_engine::SessionCallbackReentrancy::Allowed)
@@ -1377,8 +1350,6 @@ fn session_descriptor(
           callback_type_id: #callback_type_id,
           retention: #retention,
           threading: #threading,
-          call_style: #call_style,
-          error_style: #error_style,
           reentrancy: #reentrancy,
         }
       })

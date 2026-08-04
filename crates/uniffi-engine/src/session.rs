@@ -25,18 +25,6 @@ pub enum SessionCallbackThreading {
   MayCrossThread,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SessionCallbackCallStyle {
-  Sync,
-  Async,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SessionCallbackErrorStyle {
-  Infallible,
-  Fallible,
-}
-
 /// Whether the generated host callback proxy may be entered again before the
 /// current invocation returns.
 ///
@@ -53,8 +41,6 @@ pub struct SessionCallbackArgument {
   pub callback_type_id: u32,
   pub retention: SessionCallbackRetention,
   pub threading: SessionCallbackThreading,
-  pub call_style: SessionCallbackCallStyle,
-  pub error_style: SessionCallbackErrorStyle,
   pub reentrancy: SessionCallbackReentrancy,
 }
 
