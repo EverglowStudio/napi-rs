@@ -1,0 +1,21 @@
+[package]
+name = "napi-uniffi-engine"
+version = "0.1.0"
+description = "Programmatic napi-rs backend for UniFFI JavaScript bridge plans"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/EverglowStudio/napi-rs"
+rust-version.workspace = true
+
+[dependencies]
+napi = { path = "../napi", version = "3.12.0", default-features = false, features = ["napi6", "async-runtime"] }
+napi-derive-backend = { path = "../backend", version = "6.1.1" }
+napi-family-core = { path = "../napi-family-core", version = "0.1.0" }
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["extra-traits", "full"] }
+uniffi_js_abi = { git = "https://github.com/EverglowStudio/uniffi-rs.git", rev = "c87db9d984da6c065490dda864bdd13c6ab59f0b", version = "=0.32.0" }
+uniffi_js_engine_schema = { git = "https://github.com/EverglowStudio/uniffi-rs.git", rev = "c87db9d984da6c065490dda864bdd13c6ab59f0b", version = "=0.32.0" }
+
+[lints]
+workspace = true

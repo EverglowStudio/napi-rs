@@ -1,0 +1,15 @@
+[package]
+name = "napi-family-core"
+version = "0.1.0"
+description = "Engine-neutral N-API family planning for UniFFI JavaScript backends"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/EverglowStudio/napi-rs"
+rust-version.workspace = true
+
+[dependencies]
+uniffi_js_abi = { git = "https://github.com/EverglowStudio/uniffi-rs.git", rev = "c87db9d984da6c065490dda864bdd13c6ab59f0b", version = "=0.32.0" }
+uniffi_js_engine_schema = { git = "https://github.com/EverglowStudio/uniffi-rs.git", rev = "c87db9d984da6c065490dda864bdd13c6ab59f0b", version = "=0.32.0" }
+
+[lints]
+workspace = true
