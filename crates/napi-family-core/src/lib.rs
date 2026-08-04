@@ -51,9 +51,9 @@ impl HostFlavor {
 
   /// Capabilities implemented by the family core plus the flavor hooks.
   ///
-  /// Callback reentrancy is a Node-only policy.  Both hosts can schedule an
-  /// asynchronous cross-thread callback, but synchronous cross-thread calls
-  /// are rejected by the upstream bridge contract.
+  /// Both hosts expose the same callback contract capabilities.  Their
+  /// runtime hooks differ, but callback reentrancy is part of the shared
+  /// family contract and is enforced by each flavor's generated proxy.
   pub fn capabilities(self) -> EngineCapabilities {
     let mut supported = CapabilitySet::new([
       Capability::Primitive,
@@ -78,9 +78,7 @@ impl HostFlavor {
       Capability::InputStream,
       Capability::OutputStream,
     ]);
-    if self == Self::Node {
-      supported.insert(Capability::CallbackReentrancy);
-    }
+    supported.insert(Capability::CallbackReentrancy);
     EngineCapabilities {
       engine: self.engine_kind(),
       supported,
@@ -781,10 +779,112 @@ mod tests {
       .capabilities()
       .supported
       .contains(Capability::CallbackReentrancy));
-    assert!(!HostFlavor::Ohos
+    assert!(HostFlavor::Ohos
       .capabilities()
       .supported
       .contains(Capability::CallbackReentrancy));
+  }
+
+  #[test]
+  fn ohos_family_plan_accepts_allowed_callback_reentrancy() {
+    use uniffi_js_abi::{
+      ArgumentDefinition, AsyncKind, ComponentDefinition, ComponentId, ComponentKey,
+      IdentifiedComponent, IdentifiedOperation, IdentifiedType, NamedTypeKind, OperationDefinition,
+      OperationId, OperationKind, OperationOwner, OperationSignature, OperationSourceKey,
+      Ownership, TypeDefinition, TypeId, TypeSourceKey, ValueType,
+    };
+    use uniffi_js_engine_schema::{
+      BridgePlanInput, CallbackCallStyle, CallbackContract, CallbackErrorStyle, CallbackReentrancy,
+      CallbackRetention, CallbackThreading, CallbackUseSite, PlannedOperation,
+    };
+
+    let component = ComponentKey::new("ohos-callback-fixture").unwrap();
+    let callback_key = TypeSourceKey::new(component.clone(), "Observer").unwrap();
+    let observe = IdentifiedOperation {
+      id: OperationId::new(0),
+      definition: OperationDefinition::new(
+        OperationSourceKey::new(
+          component.clone(),
+          OperationOwner::Namespace,
+          OperationKind::Function,
+          "observe",
+        )
+        .unwrap(),
+        "observe",
+        "ohos_callback_fixture::observe",
+        "ohos_callback_fixture_private_0",
+        OperationSignature {
+          arguments: vec![ArgumentDefinition::new(
+            "observer",
+            ValueType::Named(callback_key.clone()),
+            Ownership::Owned,
+          )
+          .unwrap()],
+          return_type: None,
+          async_kind: AsyncKind::Sync,
+          throws: None,
+        },
+      )
+      .unwrap(),
+    };
+    let callback_method = IdentifiedOperation {
+      id: OperationId::new(1),
+      definition: OperationDefinition::new(
+        OperationSourceKey::new(
+          component.clone(),
+          OperationOwner::Callback(callback_key.clone()),
+          OperationKind::CallbackMethod,
+          "onEvent",
+        )
+        .unwrap(),
+        "onEvent",
+        "ohos_callback_fixture::Observer::onEvent",
+        "ohos_callback_fixture_private_1",
+        OperationSignature {
+          arguments: Vec::new(),
+          return_type: None,
+          async_kind: AsyncKind::Sync,
+          throws: None,
+        },
+      )
+      .unwrap(),
+    };
+    let bridge = BridgePlan::build(BridgePlanInput {
+      components: vec![IdentifiedComponent {
+        id: ComponentId::new(0),
+        definition: ComponentDefinition::new(component, "ohos-callback-fixture").unwrap(),
+      }],
+      types: vec![IdentifiedType {
+        id: TypeId::new(0),
+        definition: TypeDefinition::new(callback_key, "Observer", NamedTypeKind::Callback).unwrap(),
+      }],
+      operations: vec![
+        PlannedOperation::new(observe),
+        PlannedOperation::new(callback_method),
+      ],
+      callbacks: vec![CallbackUseSite {
+        operation_id: OperationId::new(0),
+        callback_type: TypeId::new(0),
+        path: ValuePath::argument(0),
+        contract: CallbackContract {
+          retention: CallbackRetention::Scoped,
+          threading: CallbackThreading::CallingThread,
+          call_style: CallbackCallStyle::Sync,
+          error_style: CallbackErrorStyle::Infallible,
+          reentrancy: CallbackReentrancy::Allowed,
+        },
+      }],
+      streams: Vec::new(),
+      targets: vec![HostFlavor::Ohos.capabilities()],
+    })
+    .unwrap();
+
+    let family = FamilyPlan::build(&bridge, HostFlavor::Ohos).unwrap();
+    assert_eq!(family.operations()[0].callbacks.len(), 1);
+    assert_eq!(
+      family.operations()[0].callbacks[0].contract.reentrancy,
+      CallbackReentrancy::Allowed
+    );
   }
 
   #[test]
