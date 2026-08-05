@@ -339,6 +339,29 @@ impl SessionCallbackInvoker {
     Ok(())
   }
 
+  /// Resolve the active session Host and Env for one owner-thread operation.
+  ///
+  /// The callback receives borrowed handles that are valid only for the
+  /// duration of this call.  In particular, callers must not move either
+  /// value into a proxy/future or store their raw N-API pointers.  The Host
+  /// comes from the SessionState's persistent reference, so this remains
+  /// valid after a per-invocation host proxy has been finalized.
+  pub fn with_host<R>(&self, callback: impl FnOnce(&Env, &Object<'static>) -> R) -> Result<R> {
+    self.check_open()?;
+    let state = self.inner.gate.state_ptr();
+    if state.is_null() || !self.inner.gate.invocations_are_open() {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "UniFFI callback invoker is closed",
+      ));
+    }
+    // Safety: `state` is published by `install_state` and is cleared before
+    // state-owned N-API references are released.  Owner-thread/open checks
+    // above prevent a revoked state from being dereferenced.
+    let state = unsafe { &*state };
+    state.with_host(callback)
+  }
+
   /// Retain a callback returned by a callback method while still on the
   /// owning JS thread.  The invoker resolves the live session through the
   /// lifecycle gate only after the open/thread checks pass, then delegates to
@@ -935,6 +958,13 @@ struct RetainedInvocation {
 impl SessionState {
   fn host_value(&self) -> Result<sys::napi_value> {
     reference_value(self.env, self.host.get(), "Host")
+  }
+
+  fn with_host<R>(&self, callback: impl FnOnce(&Env, &Object<'static>) -> R) -> Result<R> {
+    self.callback_invoker.check_open()?;
+    let host = Object::from_raw(self.env, self.host_value()?);
+    let env = Env::from_raw(self.env);
+    Ok(callback(&env, &host))
   }
 
   fn ensure_open(&self) -> Result<()> {
