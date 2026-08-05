@@ -1421,6 +1421,28 @@ fn family() -> FamilyPlan {
       streams: Vec::new(),
       stream_slot: None,
     },
+    FamilyOperationInput {
+      id: 55,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Sync,
+      fallible: false,
+      argument_count: 1,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result_resources: Vec::new(),
+      callbacks: vec![CallbackUseSite {
+        operation_id: 55,
+        callback_type_id: 0,
+        path: ValuePath::argument(0),
+        contract: CallbackContract {
+          retention: CallbackRetention::Scoped,
+          threading: CallbackThreading::CallingThread,
+          reentrancy: CallbackReentrancy::Allowed,
+        },
+      }],
+      streams: Vec::new(),
+      stream_slot: None,
+    },
   ]);
   operations[5].receiver = Some(ReceiverBinding::Resource(ResourceBinding {
     kind: ResourceKind::InputStream,
@@ -2215,6 +2237,24 @@ fn plan(family: &FamilyPlan) -> RustBridgePlan {
         map: syn::parse_quote!(fixture::map_error),
       },
     },
+    RustOperationPlan {
+      operation_id: id(55),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::hold_callback),
+      },
+      receiver: None,
+      arguments: vec![RustArgumentPlan {
+        name: Ident::new("callback", Span::call_site()),
+        binding: ArgumentBinding::CallbackProxy {
+          rust_type: syn::parse_quote!(fixture::CallbackProxy),
+          build: syn::parse_quote!(fixture::build_returned_callback_proxy),
+        },
+      }],
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
   ];
   RustBridgePlan::build_with_resource_hooks(
     family,
@@ -2469,6 +2509,11 @@ mod fixture {{
     assert_eq!(callback_type_id, 0); assert_eq!(contract.callback_type_id, 0); assert_eq!(contract.retention, napi_uniffi_engine::SessionCallbackRetention::Scoped); assert_eq!(contract.threading, napi_uniffi_engine::SessionCallbackThreading::MayCrossThread); assert_eq!(contract.reentrancy, napi_uniffi_engine::SessionCallbackReentrancy::Allowed);
     let callback = host.get_named_property::<Function<'static, ScopedCallbackArgs, Promise<CallbackEnvelope>>>("invokeCallbackAsync").map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?.build_threadsafe_function().build().map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?;
     Ok(ScopedAsyncProxy {{ id: callback_id, invoker, callback: Arc::new(callback) }})
+  }}
+  pub fn build_returned_callback_proxy(_host: &Object<'static>, callback_type_id: u32, callback_id: u32, contract: napi_uniffi_engine::SessionCallbackArgument, invoker: napi_uniffi_engine::SessionCallbackInvoker) -> Result<CallbackProxy, napi_uniffi_engine::BridgeErrorDescriptor> {{
+    assert_eq!(callback_type_id, 0); assert_eq!(contract.callback_type_id, 0); assert_eq!(contract.retention, napi_uniffi_engine::SessionCallbackRetention::Scoped); assert_eq!(contract.threading, napi_uniffi_engine::SessionCallbackThreading::CallingThread); assert_eq!(contract.reentrancy, napi_uniffi_engine::SessionCallbackReentrancy::Allowed);
+    let lease = invoker.retain_returned_callback(callback_type_id, callback_id).map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::backend(error.to_string()))?;
+    Ok(CallbackProxy {{ id: callback_id, lease }})
   }}
   pub async fn invoke_scoped_callback(proxy: ScopedAsyncProxy) -> Result<u32, napi_uniffi_engine::BridgeErrorDescriptor> {{
     let invocation_id = proxy.invoker.next_invocation_id().map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::backend(error.to_string()))?;
@@ -3257,6 +3302,58 @@ const assertOneTeardownTimer = (before, label) => {
   assert.deepEqual(scopedCalls.map((call) => call[2]), [40, 41]);
   assert.deepEqual(scopedCalls.map((call) => call[4]), [0, 1]);
   await scopedSession.close();
+
+  // A callback proxy returned by a callback-method/typed lowerer may retain
+  // its JS registration from the owning thread without receiving an
+  // argument-transfer lease. The helper below exercises that exact API and
+  // verifies close-vs-drop remains one logical release.
+  const returnedCallbackSession = addon.__uniffi_backend_factory(host);
+  assert.equal(returnedCallbackSession.invokeSync(55, [77]).value, 77);
+  assert.deepEqual(retained.at(-1), [0, 77]);
+  returnedCallbackSession.invokeSync(22, []);
+  for (let turn = 0; turn < 10 && releasedCallbacks.filter(([typeId, id]) => typeId === 0 && id === 77).length === 0; turn++) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  assert.equal(releasedCallbacks.filter(([typeId, id]) => typeId === 0 && id === 77).length, 1);
+  await returnedCallbackSession.close();
+
+  const returnedCallbackRace = addon.__uniffi_backend_factory(host);
+  assert.equal(returnedCallbackRace.invokeSync(55, [78]).value, 78);
+  await returnedCallbackRace.close();
+  // The proxy remains in the fixture until a separate owning session drops
+  // it; session close has already claimed the lease, so this is still once.
+  const returnedCallbackDropper = addon.__uniffi_backend_factory(host);
+  returnedCallbackDropper.invokeSync(22, []);
+  await returnedCallbackDropper.close();
+  assert.equal(releasedCallbacks.filter(([typeId, id]) => typeId === 0 && id === 78).length, 1);
+
+  const failedReturnedCallback = addon.__uniffi_backend_factory(host);
+  failRetain = true;
+  let failedReturnedEnvelope;
+  try {
+    failedReturnedEnvelope = failedReturnedCallback.invokeSync(55, [80]);
+  } catch (_) {
+    failedReturnedEnvelope = { kind: 'error' };
+  }
+  assert.equal(failedReturnedEnvelope.kind, 'error');
+  failRetain = false;
+  for (let turn = 0; turn < 10 && releasedCallbacks.filter(([typeId, id]) => typeId === 0 && id === 80).length === 0; turn++) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  assert.equal(releasedCallbacks.filter(([typeId, id]) => typeId === 0 && id === 80).length, 1);
+  await failedReturnedCallback.close();
+
+  const closedReturnedCallback = addon.__uniffi_backend_factory(host);
+  await closedReturnedCallback.close();
+  const retainedBeforeClosedReturn = retained.slice();
+  let closedReturnedEnvelope;
+  try {
+    closedReturnedEnvelope = closedReturnedCallback.invokeSync(55, [79]);
+  } catch (_) {
+    closedReturnedEnvelope = { kind: 'error' };
+  }
+  assert.equal(closedReturnedEnvelope.kind, 'error');
+  assert.deepEqual(retained, retainedBeforeClosedReturn);
 
   let droppedSession = addon.__uniffi_backend_factory(host);
   const droppedOutput = droppedSession.invokeAsync(9, []);
