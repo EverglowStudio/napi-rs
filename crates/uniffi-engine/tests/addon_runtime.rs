@@ -1444,6 +1444,86 @@ fn family() -> FamilyPlan {
       stream_slot: None,
     },
   ]);
+  operations.extend([
+    FamilyOperationInput {
+      id: 56,
+      kind: OperationKind::OutputStreamNext,
+      async_kind: AsyncKind::Async,
+      fallible: false,
+      argument_count: 0,
+      dispatch: OperationDispatch::Native,
+      receiver: Some(ReceiverBinding::Resource(ResourceBinding {
+        kind: ResourceKind::OutputStream,
+        ownership: ResourceOwnership::Borrowed,
+      })),
+      result_resources: vec![napi_family_core::ResultResourceUseSite {
+        operation_id: 56,
+        path: ValuePath::new(vec![
+          napi_family_core::ValuePathSegment::Return,
+          napi_family_core::ValuePathSegment::StreamItem,
+        ]),
+        binding: ResourceBinding {
+          kind: ResourceKind::Object,
+          ownership: ResourceOwnership::Owned,
+        },
+      }],
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 57,
+      kind: OperationKind::OutputStreamNext,
+      async_kind: AsyncKind::Async,
+      fallible: false,
+      argument_count: 0,
+      dispatch: OperationDispatch::Native,
+      receiver: Some(ReceiverBinding::Resource(ResourceBinding {
+        kind: ResourceKind::OutputStream,
+        ownership: ResourceOwnership::Borrowed,
+      })),
+      result_resources: vec![napi_family_core::ResultResourceUseSite {
+        operation_id: 57,
+        path: ValuePath::new(vec![
+          napi_family_core::ValuePathSegment::Return,
+          napi_family_core::ValuePathSegment::StreamError,
+        ]),
+        binding: ResourceBinding {
+          kind: ResourceKind::Object,
+          ownership: ResourceOwnership::Owned,
+        },
+      }],
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 58,
+      kind: OperationKind::OutputStreamNext,
+      async_kind: AsyncKind::Async,
+      fallible: false,
+      argument_count: 0,
+      dispatch: OperationDispatch::Native,
+      receiver: Some(ReceiverBinding::Resource(ResourceBinding {
+        kind: ResourceKind::OutputStream,
+        ownership: ResourceOwnership::Borrowed,
+      })),
+      result_resources: vec![napi_family_core::ResultResourceUseSite {
+        operation_id: 58,
+        path: ValuePath::new(vec![
+          napi_family_core::ValuePathSegment::Return,
+          napi_family_core::ValuePathSegment::StreamItem,
+        ]),
+        binding: ResourceBinding {
+          kind: ResourceKind::Object,
+          ownership: ResourceOwnership::Owned,
+        },
+      }],
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+  ]);
   operations[5].receiver = Some(ReceiverBinding::Resource(ResourceBinding {
     kind: ResourceKind::InputStream,
     ownership: ResourceOwnership::Borrowed,
@@ -2255,6 +2335,63 @@ fn plan(family: &FamilyPlan) -> RustBridgePlan {
       },
       error_binding: ErrorBinding::Infallible,
     },
+    RustOperationPlan {
+      operation_id: id(56),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::next_output_object_item),
+      },
+      receiver: Some(napi_uniffi_engine::RustReceiverPlan {
+        name: Ident::new("stream", Span::call_site()),
+        binding: ArgumentBinding::OutputStreamLease {
+          carrier_type: syn::parse_quote!(u32),
+          lower: syn::parse_quote!(fixture::lower_output),
+          ownership: ResourceOwnership::Borrowed,
+        },
+      }),
+      arguments: Vec::new(),
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(fixture::OutputObjectItemStep),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(57),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::next_output_object_error),
+      },
+      receiver: Some(napi_uniffi_engine::RustReceiverPlan {
+        name: Ident::new("stream", Span::call_site()),
+        binding: ArgumentBinding::OutputStreamLease {
+          carrier_type: syn::parse_quote!(u32),
+          lower: syn::parse_quote!(fixture::lower_output),
+          ownership: ResourceOwnership::Borrowed,
+        },
+      }),
+      arguments: Vec::new(),
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(fixture::OutputObjectErrorStep),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(58),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::late_output_object_item),
+      },
+      receiver: Some(napi_uniffi_engine::RustReceiverPlan {
+        name: Ident::new("stream", Span::call_site()),
+        binding: ArgumentBinding::OutputStreamLease {
+          carrier_type: syn::parse_quote!(u32),
+          lower: syn::parse_quote!(fixture::lower_output),
+          ownership: ResourceOwnership::Borrowed,
+        },
+      }),
+      arguments: Vec::new(),
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(fixture::OutputObjectItemStep),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
   ];
   RustBridgePlan::build_with_resource_hooks(
     family,
@@ -2380,6 +2517,10 @@ mod fixture {{
   #[napi(object)]
   pub struct OutputStep {{ pub kind: String }}
   #[napi(object)]
+  pub struct OutputObjectItemStep {{ pub kind: String, pub value: ObjectHandle }}
+  #[napi(object)]
+  pub struct OutputObjectErrorStep {{ pub kind: String, pub error: ObjectHandle }}
+  #[napi(object)]
   pub struct CallbackResult {{ pub callback: u32 }}
   #[napi(object)]
   pub struct NestedObjectVariant {{ pub tag: String, pub object: ObjectHandle }}
@@ -2413,6 +2554,7 @@ mod fixture {{
   static NESTED_CALLBACK_HOLDS: Mutex<Vec<napi_uniffi_engine::SessionCallbackLease>> = Mutex::new(Vec::new());
   static DIRECT_CALLBACK_HOLDS: Mutex<Vec<CallbackProxy>> = Mutex::new(Vec::new());
   static NEXT_OUTPUT: AtomicU32 = AtomicU32::new(101);
+  static NEXT_STREAM_OBJECT: AtomicU32 = AtomicU32::new(1001);
   static CANCEL_GATE_ARMED: AtomicBool = AtomicBool::new(false);
   static CANCEL_GATE_RELEASED: AtomicBool = AtomicBool::new(true);
   static CALLBACK_DROP_ARMED: AtomicBool = AtomicBool::new(false);
@@ -2631,6 +2773,16 @@ mod fixture {{
   pub fn lift_output(handle: u32) -> Result<OutputHandle, napi_uniffi_engine::BridgeErrorDescriptor> {{ Ok(OutputHandle {{ handle }}) }}
   pub fn lower_output(stream: u32) -> Result<u32, napi_uniffi_engine::BridgeErrorDescriptor> {{ Ok(stream) }}
   pub async fn next_output(_stream: u32) -> OutputStep {{ OutputStep {{ kind: "done".to_owned() }} }}
+  pub async fn next_output_object_item(_stream: u32) -> OutputObjectItemStep {{
+    OutputObjectItemStep {{ kind: "item".to_owned(), value: ObjectHandle {{ handle: NEXT_STREAM_OBJECT.fetch_add(1, Ordering::Relaxed) }} }}
+  }}
+  pub async fn next_output_object_error(_stream: u32) -> OutputObjectErrorStep {{
+    OutputObjectErrorStep {{ kind: "error".to_owned(), error: ObjectHandle {{ handle: NEXT_STREAM_OBJECT.fetch_add(1, Ordering::Relaxed) }} }}
+  }}
+  pub async fn late_output_object_item(_stream: u32) -> OutputObjectItemStep {{
+    while !LATE_OUTPUT_RESULT_RELEASED.load(Ordering::Acquire) {{ std::thread::yield_now(); }}
+    OutputObjectItemStep {{ kind: "item".to_owned(), value: ObjectHandle {{ handle: 3001 }} }}
+  }}
   pub async fn cancel_output(_stream: u32) {{}}
   pub fn start_bidi(_source: u32) -> u32 {{ 202 }}
   pub fn release_object(handle: u32) -> Result<(), napi_uniffi_engine::BridgeErrorDescriptor> {{
@@ -2847,6 +2999,57 @@ const assertOneTeardownTimer = (before, label) => {
     assert.equal(await outputCancelCount(handle), 1, `nested output ${handle} cancelled once`);
     assert.equal(await outputReleaseCount(handle), 1, `nested output ${handle} released once`);
   }
+
+  // StreamStep is a first-class resource path.  The live item branch retains
+  // its owned object until explicit release, while the error branch is
+  // released by session close; both branches must preserve the exact tagged
+  // own-key shape.
+  const stepLiveSession = addon.__uniffi_backend_factory(host);
+  const stepLiveOutput = (await stepLiveSession.invokeAsync(9, [])).value;
+  const liveItemStep = (await stepLiveSession.invokeAsync(56, [stepLiveOutput])).value;
+  assert.deepEqual(Object.keys(liveItemStep).sort(), ['kind', 'value']);
+  assert.equal(liveItemStep.kind, 'item');
+  assert.equal(liveItemStep.value.handle, 1001);
+  stepLiveSession.releaseObject(liveItemStep.value);
+  await stepLiveSession.close();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(await objectReleaseCount(1001), 1, 'live StreamItem object released exactly once');
+  assert.equal(await outputCancelCount(stepLiveOutput.handle), 1, 'live step output cancelled once');
+  assert.equal(await outputReleaseCount(stepLiveOutput.handle), 1, 'live step output released once');
+
+  const stepErrorSession = addon.__uniffi_backend_factory(host);
+  const stepErrorOutput = (await stepErrorSession.invokeAsync(9, [])).value;
+  const errorStep = (await stepErrorSession.invokeAsync(57, [stepErrorOutput])).value;
+  assert.deepEqual(Object.keys(errorStep).sort(), ['error', 'kind']);
+  assert.equal(errorStep.kind, 'error');
+  assert.equal(errorStep.error.handle, 1002);
+  await stepErrorSession.close();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(await objectReleaseCount(1002), 1, 'StreamError object released exactly once');
+  assert.equal(await outputCancelCount(stepErrorOutput.handle), 1, 'error step output cancelled once');
+  assert.equal(await outputReleaseCount(stepErrorOutput.handle), 1, 'error step output released once');
+
+  // A late output step settles only after deadline detach.  The detached
+  // walker still follows StreamItem and disposes its object exactly once,
+  // independently of the output receiver cleanup.
+  const lateStepController = addon.__uniffi_backend_factory(host);
+  lateStepController.invokeSync(31, []);
+  const lateStepSession = addon.__uniffi_backend_factory(host);
+  const lateStepOutput = (await lateStepSession.invokeAsync(9, [])).value;
+  const lateStepResult = lateStepSession.invokeAsync(58, [lateStepOutput]);
+  const lateStepClose = lateStepSession.close();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  await lateStepClose;
+  lateStepController.invokeSync(32, []);
+  const lateItemStep = (await lateStepResult).value;
+  assert.deepEqual(Object.keys(lateItemStep).sort(), ['kind', 'value']);
+  assert.equal(lateItemStep.value.handle, 3001);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(await objectReleaseCount(3001), 1, 'late StreamItem object released exactly once');
+  assert.equal(await outputCancelCount(lateStepOutput.handle), 1, 'late step output cancelled once');
+  assert.equal(await outputReleaseCount(lateStepOutput.handle), 1, 'late step output released once');
+  await lateStepController.close();
+
   session.invokeSync(17, [3]);
   await session.invokeAsync(18, [3]);
   session.invokeSync(19, [3]);
