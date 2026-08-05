@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use napi_family_core::{
   AsyncKind, CallbackContract, CallbackReentrancy, CallbackRetention, CallbackThreading,
-  CallbackUseSite, FamilyOperationInput, FamilyPlan, FamilyPlanInput, HostFlavor,
-  OperationDispatch, OperationKind, ResourceBinding, ResourceKind, ResourceOwnership,
+  CallbackUseSite, ClosePolicy, DeadlineAction, FamilyOperationInput, FamilyPlan, FamilyPlanInput,
+  HostFlavor, OperationDispatch, OperationKind, ResourceBinding, ResourceKind, ResourceOwnership,
   StreamDirection, StreamSlotIdentity, StreamUseSite, StreamValueBinding, ValuePath,
 };
 use napi_uniffi_engine::{
@@ -818,6 +818,213 @@ fn family() -> FamilyPlan {
       streams: Vec::new(),
       stream_slot: None,
     },
+    FamilyOperationInput {
+      id: 33,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Async,
+      fallible: false,
+      argument_count: 1,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result: None,
+      callbacks: vec![CallbackUseSite {
+        operation_id: 33,
+        callback_type_id: 0,
+        path: ValuePath::argument(0),
+        contract: CallbackContract {
+          retention: CallbackRetention::Retained,
+          threading: CallbackThreading::MayCrossThread,
+          reentrancy: CallbackReentrancy::Allowed,
+        },
+      }],
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 34,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Sync,
+      fallible: false,
+      argument_count: 1,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result: Some(ResourceBinding {
+        kind: ResourceKind::Object,
+        ownership: ResourceOwnership::Owned,
+      }),
+      callbacks: vec![CallbackUseSite {
+        operation_id: 34,
+        callback_type_id: 0,
+        path: ValuePath::argument(0),
+        contract: CallbackContract {
+          retention: CallbackRetention::Retained,
+          threading: CallbackThreading::MayCrossThread,
+          reentrancy: CallbackReentrancy::Allowed,
+        },
+      }],
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 35,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Sync,
+      fallible: false,
+      argument_count: 1,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result: Some(ResourceBinding {
+        kind: ResourceKind::OutputStream,
+        ownership: ResourceOwnership::Owned,
+      }),
+      callbacks: vec![CallbackUseSite {
+        operation_id: 35,
+        callback_type_id: 0,
+        path: ValuePath::argument(0),
+        contract: CallbackContract {
+          retention: CallbackRetention::Retained,
+          threading: CallbackThreading::MayCrossThread,
+          reentrancy: CallbackReentrancy::Allowed,
+        },
+      }],
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 36,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Sync,
+      fallible: false,
+      argument_count: 0,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result: None,
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 37,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Sync,
+      fallible: false,
+      argument_count: 0,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result: None,
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 38,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Sync,
+      fallible: false,
+      argument_count: 0,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result: None,
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 39,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Sync,
+      fallible: false,
+      argument_count: 1,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result: None,
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 40,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Sync,
+      fallible: false,
+      argument_count: 1,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result: None,
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 41,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Sync,
+      fallible: false,
+      argument_count: 1,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result: None,
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 42,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Async,
+      fallible: true,
+      argument_count: 1,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result: None,
+      callbacks: vec![CallbackUseSite {
+        operation_id: 42,
+        callback_type_id: 0,
+        path: ValuePath::argument(0),
+        contract: CallbackContract {
+          retention: CallbackRetention::Retained,
+          threading: CallbackThreading::MayCrossThread,
+          reentrancy: CallbackReentrancy::Allowed,
+        },
+      }],
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 43,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Async,
+      fallible: false,
+      argument_count: 1,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result: None,
+      callbacks: vec![CallbackUseSite {
+        operation_id: 43,
+        callback_type_id: 0,
+        path: ValuePath::argument(0),
+        contract: CallbackContract {
+          retention: CallbackRetention::Retained,
+          threading: CallbackThreading::MayCrossThread,
+          reentrancy: CallbackReentrancy::Allowed,
+        },
+      }],
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 44,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Sync,
+      fallible: false,
+      argument_count: 0,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result: None,
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
   ]);
   operations[5].receiver = Some(ResourceBinding {
     kind: ResourceKind::InputStream,
@@ -839,6 +1046,13 @@ fn family() -> FamilyPlan {
   });
   FamilyPlan::build(FamilyPlanInput {
     flavor: HostFlavor::Node,
+    close_policy: ClosePolicy {
+      // The canonical frontend supplies the production default.  This addon
+      // intentionally installs a short explicit policy to exercise deadline
+      // detach without making the real Node test wait seconds.
+      grace_ms: 40,
+      on_deadline: DeadlineAction::Detach,
+    },
     operations,
   })
   .unwrap()
@@ -1261,6 +1475,199 @@ fn plan(family: &FamilyPlan) -> RustBridgePlan {
       },
       error_binding: ErrorBinding::Infallible,
     },
+    RustOperationPlan {
+      operation_id: id(33),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::invoke_host_late),
+      },
+      receiver: None,
+      arguments: vec![RustArgumentPlan {
+        name: Ident::new("probe", Span::call_site()),
+        binding: ArgumentBinding::CallbackProxy {
+          rust_type: syn::parse_quote!(fixture::HostCallProxy),
+          build: syn::parse_quote!(fixture::build_host_call_proxy),
+        },
+      }],
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(34),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::make_object_reentrant),
+      },
+      receiver: None,
+      arguments: vec![RustArgumentPlan {
+        name: Ident::new("probe", Span::call_site()),
+        binding: ArgumentBinding::CallbackProxy {
+          rust_type: syn::parse_quote!(fixture::HostCallProxy),
+          build: syn::parse_quote!(fixture::build_reentrant_proxy),
+        },
+      }],
+      return_binding: ReturnBinding::ObjectLease {
+        carrier_type: syn::parse_quote!(fixture::ObjectHandle),
+        lift: syn::parse_quote!(fixture::lift_object),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(35),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::make_output_reentrant),
+      },
+      receiver: None,
+      arguments: vec![RustArgumentPlan {
+        name: Ident::new("probe", Span::call_site()),
+        binding: ArgumentBinding::CallbackProxy {
+          rust_type: syn::parse_quote!(fixture::HostCallProxy),
+          build: syn::parse_quote!(fixture::build_reentrant_proxy),
+        },
+      }],
+      return_binding: ReturnBinding::OutputStreamLease {
+        carrier_type: syn::parse_quote!(fixture::OutputHandle),
+        lift: syn::parse_quote!(fixture::lift_output),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(36),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::arm_host_proxy_gate),
+      },
+      receiver: None,
+      arguments: Vec::new(),
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(37),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::release_host_proxy_gate),
+      },
+      receiver: None,
+      arguments: Vec::new(),
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(38),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::call_held_host),
+      },
+      receiver: None,
+      arguments: Vec::new(),
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(39),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::object_release_count),
+      },
+      receiver: None,
+      arguments: vec![RustArgumentPlan {
+        name: Ident::new("handle", Span::call_site()),
+        binding: ArgumentBinding::Direct {
+          carrier_type: syn::parse_quote!(u32),
+        },
+      }],
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(40),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::output_cancel_count),
+      },
+      receiver: None,
+      arguments: vec![RustArgumentPlan {
+        name: Ident::new("handle", Span::call_site()),
+        binding: ArgumentBinding::Direct {
+          carrier_type: syn::parse_quote!(u32),
+        },
+      }],
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(41),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::output_release_count),
+      },
+      receiver: None,
+      arguments: vec![RustArgumentPlan {
+        name: Ident::new("handle", Span::call_site()),
+        binding: ArgumentBinding::Direct {
+          carrier_type: syn::parse_quote!(u32),
+        },
+      }],
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(42),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::invoke_host_late_fallible),
+      },
+      receiver: None,
+      arguments: vec![RustArgumentPlan {
+        name: Ident::new("probe", Span::call_site()),
+        binding: ArgumentBinding::CallbackProxy {
+          rust_type: syn::parse_quote!(fixture::HostCallProxy),
+          build: syn::parse_quote!(fixture::build_host_call_proxy),
+        },
+      }],
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      error_binding: ErrorBinding::Descriptor {
+        map: syn::parse_quote!(fixture::map_error),
+      },
+    },
+    RustOperationPlan {
+      operation_id: id(43),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::invoke_two_host_methods_late),
+      },
+      receiver: None,
+      arguments: vec![RustArgumentPlan {
+        name: Ident::new("probe", Span::call_site()),
+        binding: ArgumentBinding::CallbackProxy {
+          rust_type: syn::parse_quote!(fixture::TwoHostCallProxy),
+          build: syn::parse_quote!(fixture::build_two_host_call_proxy),
+        },
+      }],
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(44),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::release_two_host_methods_gate),
+      },
+      receiver: None,
+      arguments: Vec::new(),
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
   ];
   RustBridgePlan::build_with_resource_hooks(
     family,
@@ -1374,9 +1781,10 @@ unsafe impl AsyncRuntime for FixtureRuntime {{
 fn install_runtime() {{ register_async_runtime(FixtureRuntime {{ active: AtomicBool::new(false), workers: Mutex::new(Vec::new()) }}); }}
 
 mod fixture {{
-  use napi::bindgen_prelude::JsObjectValue;
+  use napi::bindgen_prelude::{{Function, JsObjectValue, Object}};
+  use napi::threadsafe_function::{{ThreadsafeFunction, ThreadsafeFunctionCallMode}};
   use napi_derive::napi;
-  use std::sync::{{atomic::{{AtomicBool, AtomicU32, Ordering}}, Mutex}};
+  use std::sync::{{atomic::{{AtomicBool, AtomicU32, Ordering}}, Arc, Mutex}};
 
   #[napi(object)]
   pub struct ObjectHandle {{ pub handle: u32 }}
@@ -1399,8 +1807,17 @@ mod fixture {{
   static CALLBACK_DROP_WORKER: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
   static ASYNC_CALLBACK_RESULT_RELEASED: AtomicBool = AtomicBool::new(true);
   static LATE_OUTPUT_RESULT_RELEASED: AtomicBool = AtomicBool::new(true);
+  static HOST_PROXY_GATE_RELEASED: AtomicBool = AtomicBool::new(true);
+  static HELD_HOST_PROXY: Mutex<Option<HostCallProxy>> = Mutex::new(None);
+  static TWO_HOST_METHODS_RELEASED: AtomicBool = AtomicBool::new(false);
+  static HELD_TWO_HOST_METHOD: Mutex<Option<(ThreadsafeFunction<u32, (), u32, napi::Status, false>, u32)>> = Mutex::new(None);
 
   pub struct CallbackProxy {{ id: u32, lease: napi_uniffi_engine::SessionCallbackLease }}
+  struct HostCallProxyInner {{ id: u32, call: ThreadsafeFunction<u32, (), u32, napi::Status, false>, _lease: napi_uniffi_engine::SessionCallbackLease }}
+  #[derive(Clone)]
+  pub struct HostCallProxy {{ inner: Arc<HostCallProxyInner> }}
+  struct TwoHostCallProxyInner {{ id: u32, first: Mutex<Option<ThreadsafeFunction<u32, (), u32, napi::Status, false>>>, second: Mutex<Option<ThreadsafeFunction<u32, (), u32, napi::Status, false>>>, _lease: napi_uniffi_engine::SessionCallbackLease }}
+  pub struct TwoHostCallProxy {{ inner: Arc<TwoHostCallProxyInner> }}
 
   pub fn answer() -> i64 {{ 42 }}
   pub async fn plus_one(value: i64) -> i64 {{ value + 1 }}
@@ -1445,6 +1862,70 @@ mod fixture {{
   }}
   pub fn observe(callback_id: u32) -> u32 {{ callback_id }}
   pub fn build_input_stream_proxy(_host: &napi::bindgen_prelude::Object<'static>, stream_id: u32) -> Result<u32, napi_uniffi_engine::BridgeErrorDescriptor> {{ Ok(stream_id) }}
+  pub fn build_host_call_proxy(host: &Object<'static>, _callback_type_id: u32, callback_id: u32, _contract: napi_uniffi_engine::SessionCallbackArgument, lease: napi_uniffi_engine::SessionCallbackLease) -> Result<HostCallProxy, napi_uniffi_engine::BridgeErrorDescriptor> {{
+    let method = host.get_named_property::<Function<'static, u32, ()>>("recordHostCall").map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?;
+    let call = method.build_threadsafe_function().callee_handled::<false>().build_callback(|context| Ok(context.value)).map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?;
+    Ok(HostCallProxy {{ inner: Arc::new(HostCallProxyInner {{ id: callback_id, call, _lease: lease }}) }})
+  }}
+  pub fn build_two_host_call_proxy(host: &Object<'static>, _callback_type_id: u32, callback_id: u32, _contract: napi_uniffi_engine::SessionCallbackArgument, lease: napi_uniffi_engine::SessionCallbackLease) -> Result<TwoHostCallProxy, napi_uniffi_engine::BridgeErrorDescriptor> {{
+    // Accessing the same property twice creates two method wrappers on one
+    // invocation Proxy.  The first TSFN is dropped while the second remains
+    // live so an early method finalizer cannot invalidate its host target.
+    let first_method = host.get_named_property::<Function<'static, u32, ()>>("recordHostCall").map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?;
+    let first = first_method.build_threadsafe_function().callee_handled::<false>().build_callback(|context| Ok(context.value)).map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?;
+    let second_method = host.get_named_property::<Function<'static, u32, ()>>("recordHostCall").map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?;
+    let second = second_method.build_threadsafe_function().callee_handled::<false>().build_callback(|context| Ok(context.value)).map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?;
+    Ok(TwoHostCallProxy {{ inner: Arc::new(TwoHostCallProxyInner {{ id: callback_id, first: Mutex::new(Some(first)), second: Mutex::new(Some(second)), _lease: lease }}) }})
+  }}
+  pub fn build_reentrant_proxy(host: &Object<'static>, callback_type_id: u32, callback_id: u32, contract: napi_uniffi_engine::SessionCallbackArgument, lease: napi_uniffi_engine::SessionCallbackLease) -> Result<HostCallProxy, napi_uniffi_engine::BridgeErrorDescriptor> {{
+    let proxy = build_host_call_proxy(host, callback_type_id, callback_id, contract, lease)?;
+    let close = host.get_named_property::<Function<'static, (), ()>>("reenterClose").map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?;
+    close.call(()).map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::backend(error.to_string()))?;
+    Ok(proxy)
+  }}
+  pub async fn invoke_host_late(proxy: HostCallProxy) -> u32 {{
+    while !HOST_PROXY_GATE_RELEASED.load(Ordering::Acquire) {{ std::thread::yield_now(); }}
+    HELD_HOST_PROXY.lock().unwrap().replace(proxy.clone());
+    let _ = proxy.inner.call.call_async(proxy.inner.id).await;
+    proxy.inner.id
+  }}
+  pub async fn invoke_host_late_fallible(proxy: HostCallProxy) -> Result<u32, napi_uniffi_engine::BridgeErrorDescriptor> {{
+    let id = invoke_host_late(proxy).await;
+    if id == 608 {{
+      Err(napi_uniffi_engine::BridgeErrorDescriptor::backend("fallible Host fixture error"))
+    }} else {{
+      Ok(id)
+    }}
+  }}
+  pub async fn invoke_two_host_methods_late(proxy: TwoHostCallProxy) -> u32 {{
+    while !HOST_PROXY_GATE_RELEASED.load(Ordering::Acquire) {{ std::thread::yield_now(); }}
+    let first = proxy.inner.first.lock().unwrap().take().expect("first Host method");
+    let second = proxy.inner.second.lock().unwrap().take().expect("second Host method");
+    let id = proxy.inner.id;
+    HELD_TWO_HOST_METHOD.lock().unwrap().replace((second, id));
+    drop(first);
+    drop(proxy);
+    while !TWO_HOST_METHODS_RELEASED.load(Ordering::Acquire) {{ std::thread::yield_now(); }}
+    let held = HELD_TWO_HOST_METHOD.lock().unwrap().take();
+    if let Some((second, id)) = held {{
+      let _ = second.call_async(id).await;
+    }}
+    id
+  }}
+  pub fn arm_host_proxy_gate() -> u32 {{ HOST_PROXY_GATE_RELEASED.store(false, Ordering::Release); TWO_HOST_METHODS_RELEASED.store(false, Ordering::Release); 0 }}
+  pub fn release_host_proxy_gate() -> u32 {{ HOST_PROXY_GATE_RELEASED.store(true, Ordering::Release); 0 }}
+  pub fn release_two_host_methods_gate() -> u32 {{ TWO_HOST_METHODS_RELEASED.store(true, Ordering::Release); 0 }}
+  pub fn call_held_host() -> u32 {{
+    if let Some(proxy) = HELD_HOST_PROXY.lock().unwrap().take() {{
+      let _ = proxy.inner.call.call(proxy.inner.id, ThreadsafeFunctionCallMode::NonBlocking);
+    }}
+    0
+  }}
+  pub fn make_object_reentrant(_proxy: HostCallProxy) -> u32 {{ 808 }}
+  pub fn make_output_reentrant(_proxy: HostCallProxy) -> u32 {{ 910 }}
+  pub fn object_release_count(handle: u32) -> u32 {{ OBJECT_RELEASES.lock().unwrap().iter().filter(|value| **value == handle).count() as u32 }}
+  pub fn output_cancel_count(handle: u32) -> u32 {{ OUTPUT_CANCELS.lock().unwrap().iter().filter(|value| **value == handle).count() as u32 }}
+  pub fn output_release_count(handle: u32) -> u32 {{ OUTPUT_RELEASES.lock().unwrap().iter().filter(|value| **value == handle).count() as u32 }}
   pub fn consume_input(stream_id: u32) -> u32 {{ stream_id }}
   pub fn make_object() -> u32 {{ 77 }}
   pub fn lift_object(handle: u32) -> Result<ObjectHandle, napi_uniffi_engine::BridgeErrorDescriptor> {{ Ok(ObjectHandle {{ handle }}) }}
@@ -1476,7 +1957,7 @@ mod fixture {{
   }}
   pub fn release_output(handle: u32) -> Result<(), napi_uniffi_engine::BridgeErrorDescriptor> {{
     assert!(!CANCEL_GATE_ARMED.load(Ordering::Acquire), "output released before cancel settled");
-    if handle == 909 {{
+    if handle == 909 || handle == 910 {{
       assert!(OUTPUT_CANCELS.lock().unwrap().contains(&handle), "late output released before cancel hook");
     }}
     let mut seen = OUTPUT_RELEASES.lock().unwrap();
@@ -1552,6 +2033,29 @@ mod fixture {{
   fs::copy(dylib_path(&target), &addon).unwrap();
   let script = r#"
 const assert = require('node:assert/strict');
+const originalSetTimeout = global.setTimeout;
+const originalClearTimeout = global.clearTimeout;
+const teardownTimerHandles = new Set();
+let teardownTimersCreated = 0;
+let teardownTimersCleared = 0;
+global.setTimeout = function(callback, delay, ...args) {
+  const timer = originalSetTimeout.call(this, callback, delay, ...args);
+  if (delay === 40) {
+    teardownTimersCreated += 1;
+    teardownTimerHandles.add(timer);
+  }
+  return timer;
+};
+global.clearTimeout = function(timer) {
+  if (teardownTimerHandles.delete(timer)) teardownTimersCleared += 1;
+  return originalClearTimeout.call(this, timer);
+};
+const timerSnapshot = () => ({ created: teardownTimersCreated, cleared: teardownTimersCleared });
+const assertOneTeardownTimer = (before, label) => {
+  const after = timerSnapshot();
+  assert.equal(after.created - before.created, 1, `${label}: exactly one 40ms timer created`);
+  assert.equal(after.cleared - before.cleared, 1, `${label}: exactly one 40ms timer cleared`);
+};
 (async () => {
   const addon = require(process.argv[1]);
   assert.deepEqual(Object.keys(addon), ['__uniffi_backend_factory']);
@@ -1559,7 +2063,10 @@ const assert = require('node:assert/strict');
   const releasedCallbacks = [];
   const releasedStreams = [];
   const callbackCalls = [];
+  const hostProxyCalls = [];
   let resolvePendingPull;
+  let reentrantSession;
+  let reentrantClosePromise;
   let failRetain = false;
   const host = {
     retainCallback(typeId, id) { if (failRetain) throw new Error('retain failed'); retained.push([typeId, id]); },
@@ -1569,6 +2076,8 @@ const assert = require('node:assert/strict');
     pullInputStream(id) { if (id === 44) return new Promise(resolve => { resolvePendingPull = resolve; }); return Promise.resolve({ kind: 'done' }); },
     cancelInputStream(id) { return Promise.resolve(id); },
     releaseInputStream(id) { releasedStreams.push(id); },
+    recordHostCall(id) { hostProxyCalls.push(id); return id; },
+    reenterClose() { return reentrantSession ? (reentrantClosePromise = reentrantSession.close()) : undefined; },
   };
   const session = addon.__uniffi_backend_factory(host);
   assert.equal(session.hostFlavor, 'node');
@@ -1762,6 +2271,128 @@ const assert = require('node:assert/strict');
   assert.deepEqual(retained, retainedBeforeLateCallback);
   assert.deepEqual(releasedCallbacks, releasedBeforeLateCallback);
   await lateCallbackController.close();
+
+  // HostAndArguments uses an independent revocable proxy for every async
+  // invocation.  Two futures can be held and released together without a
+  // session-level "current Host" slot; each captured proxy reaches the right
+  // application call exactly once.
+  const hostProxyController = addon.__uniffi_backend_factory(host);
+  hostProxyController.invokeSync(36, []);
+  const hostProxyA = addon.__uniffi_backend_factory(host);
+  const hostProxyB = addon.__uniffi_backend_factory(host);
+  const hostProxyAResult = hostProxyA.invokeAsync(33, [601]);
+  const hostProxyBResult = hostProxyB.invokeAsync(33, [602]);
+  hostProxyController.invokeSync(37, []);
+  assert.equal((await hostProxyAResult).value, 601);
+  assert.equal((await hostProxyBResult).value, 602);
+  assert.deepEqual(hostProxyCalls.slice(-2).sort((left, right) => left - right), [601, 602]);
+  const hostProxyATimers = timerSnapshot();
+  await hostProxyA.close();
+  assertOneTeardownTimer(hostProxyATimers, 'host proxy A natural close');
+  const hostProxyBTimers = timerSnapshot();
+  await hostProxyB.close();
+  assertOneTeardownTimer(hostProxyBTimers, 'host proxy B natural close');
+  // The last captured proxy is still held by the fixture, but natural detach
+  // revokes its lease before this post-close call reaches the application.
+  const callsBeforeNaturalLateHost = hostProxyCalls.slice();
+  hostProxyController.invokeSync(38, []);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(hostProxyCalls, callsBeforeNaturalLateHost);
+  await hostProxyController.close();
+
+  // Two method wrappers on one captured Proxy retain independent target
+  // references.  Drop the first TSFN, force a V8 collection, then let the
+  // second wrapper call the application before the invocation closes.
+  const methodGcController = addon.__uniffi_backend_factory(host);
+  methodGcController.invokeSync(36, []);
+  const methodGcSession = addon.__uniffi_backend_factory(host);
+  const methodGcResult = methodGcSession.invokeAsync(43, [606]);
+  methodGcController.invokeSync(37, []);
+  await new Promise((resolve) => setImmediate(resolve));
+  if (global.gc) { global.gc(); await new Promise((resolve) => setImmediate(resolve)); }
+  methodGcController.invokeSync(44, []);
+  assert.equal((await methodGcResult).value, 606);
+  assert.equal(hostProxyCalls.at(-1), 606);
+  await methodGcSession.close();
+  await methodGcController.close();
+
+  // Closing while the invocation is still held must settle naturally when
+  // the first captured Host call arrives before the grace deadline.
+  const naturalLateHostController = addon.__uniffi_backend_factory(host);
+  naturalLateHostController.invokeSync(36, []);
+  const naturalLateHostSession = addon.__uniffi_backend_factory(host);
+  const naturalLateHostResult = naturalLateHostSession.invokeAsync(33, [604]);
+  const naturalLateHostTimers = timerSnapshot();
+  const naturalLateHostClose = naturalLateHostSession.close();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  naturalLateHostController.invokeSync(37, []);
+  assert.equal((await naturalLateHostResult).value, 604);
+  await naturalLateHostClose;
+  assertOneTeardownTimer(naturalLateHostTimers, 'natural late Host close');
+  await naturalLateHostController.close();
+
+  // A proxy captured by an invocation that outlives the deadline may be
+  // entered by its native future after detach; the revoked lease makes that a
+  // no-op rather than an application/Host callback or an unhandled rejection.
+  const deadlineHostController = addon.__uniffi_backend_factory(host);
+  deadlineHostController.invokeSync(36, []);
+  const deadlineHostSession = addon.__uniffi_backend_factory(host);
+  const deadlineHostResult = deadlineHostSession.invokeAsync(33, [603]);
+  const callsBeforeDeadlineLateHost = hostProxyCalls.slice();
+  const deadlineHostClose = deadlineHostSession.close();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  await deadlineHostClose;
+  deadlineHostController.invokeSync(37, []);
+  assert.equal((await deadlineHostResult).value, 603);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(hostProxyCalls, callsBeforeDeadlineLateHost);
+  deadlineHostController.invokeSync(38, []);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(hostProxyCalls, callsBeforeDeadlineLateHost);
+  await deadlineHostController.close();
+
+  // A synchronous HostAndArguments lowerer can re-enter close().  The native
+  // result still crosses the original invocation boundary, while close's
+  // detached cleanup releases each late resource exactly once and never
+  // creates a new session lease.
+  reentrantSession = addon.__uniffi_backend_factory(host);
+  const reentrantObject = reentrantSession.invokeSync(34, [701]);
+  assert.equal(reentrantObject.value.handle, 808);
+  await reentrantClosePromise;
+  assert.strictEqual(reentrantSession.close(), reentrantClosePromise);
+  reentrantSession = addon.__uniffi_backend_factory(host);
+  const reentrantOutput = reentrantSession.invokeSync(35, [702]);
+  assert.equal(reentrantOutput.value.handle, 910);
+  await reentrantClosePromise;
+  await reentrantSession.close();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const reentrantResourceQuery = addon.__uniffi_backend_factory(host);
+  assert.equal(reentrantResourceQuery.invokeSync(39, [808]).value, 1);
+  assert.equal(reentrantResourceQuery.invokeSync(40, [910]).value, 1);
+  assert.equal(reentrantResourceQuery.invokeSync(41, [910]).value, 1);
+  await reentrantResourceQuery.close();
+
+  // Keep a fallible async HostAndArguments operation in the real addon so the
+  // engine's custom entry is compiled through the Descriptor error path too.
+  const fallibleHostController = addon.__uniffi_backend_factory(host);
+  const fallibleHostSession = addon.__uniffi_backend_factory(host);
+  assert.equal((await fallibleHostSession.invokeAsync(42, [605])).value, 605);
+  await fallibleHostSession.close();
+  fallibleHostController.invokeSync(38, []);
+  await fallibleHostController.close();
+  const fallibleErrorController = addon.__uniffi_backend_factory(host);
+  fallibleErrorController.invokeSync(36, []);
+  const fallibleErrorSession = addon.__uniffi_backend_factory(host);
+  const fallibleErrorResult = fallibleErrorSession.invokeAsync(42, [608]);
+  fallibleErrorController.invokeSync(37, []);
+  const fallibleErrorEnvelope = await fallibleErrorResult;
+  assert.equal(fallibleErrorEnvelope.kind, 'error');
+  assert.equal(fallibleErrorEnvelope.error.message, 'fallible Host fixture error');
+  await fallibleErrorSession.close();
+  fallibleErrorController.invokeSync(38, []);
+  await fallibleErrorController.close();
+
   const pending = session.invokeAsync(9, []);
   await session.close();
   await pending;
@@ -1776,6 +2407,50 @@ const assert = require('node:assert/strict');
   await drainingPull;
   await drainingClose;
   assert.equal(drainingCloseSettled, true);
+
+  // Every teardown uses one short Node timer.  A never-settling callback,
+  // input pull and output cancel must detach at the same deadline; resolving
+  // any of them afterwards cannot re-enter Host or duplicate release hooks.
+  const deadlineCallbackSession = addon.__uniffi_backend_factory(host);
+  const deadlineCallbackController = addon.__uniffi_backend_factory(host);
+  deadlineCallbackController.invokeSync(28, []);
+  const deadlineRetained = retained.slice();
+  const deadlineReleased = releasedCallbacks.slice();
+  const deadlineCallbackResult = deadlineCallbackSession.invokeAsync(27, []);
+  let deadlineCallbackClosed = false;
+  const deadlineCallbackClose = deadlineCallbackSession.close().then(() => { deadlineCallbackClosed = true; });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(deadlineCallbackClosed, true);
+  deadlineCallbackController.invokeSync(29, []);
+  await deadlineCallbackResult;
+  assert.deepEqual(retained, deadlineRetained);
+  assert.deepEqual(releasedCallbacks, deadlineReleased);
+  await deadlineCallbackController.close();
+
+  const deadlineInputSession = addon.__uniffi_backend_factory(host);
+  const deadlineInput = deadlineInputSession.invokeAsync(5, [44]);
+  let deadlineInputClosed = false;
+  const deadlineInputClose = deadlineInputSession.close().then(() => { deadlineInputClosed = true; });
+  const releasedBeforeDeadlineInput = releasedStreams.slice();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(deadlineInputClosed, true);
+  resolvePendingPull({ kind: 'done' });
+  await deadlineInput;
+  assert.deepEqual(releasedStreams, releasedBeforeDeadlineInput);
+
+  const deadlineOutputSession = addon.__uniffi_backend_factory(host);
+  const deadlineOutputController = addon.__uniffi_backend_factory(host);
+  deadlineOutputController.invokeSync(23, []);
+  const deadlineOutput = (await deadlineOutputSession.invokeAsync(9, [])).value;
+  const deadlineCancel = deadlineOutputSession.cancelOutputStream(deadlineOutput);
+  let deadlineOutputClosed = false;
+  const deadlineOutputClose = deadlineOutputSession.close().then(() => { deadlineOutputClosed = true; });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(deadlineOutputClosed, true);
+  deadlineOutputController.invokeSync(24, []);
+  await deadlineCancel;
+  await deadlineOutputController.close();
+
   let droppedSession = addon.__uniffi_backend_factory(host);
   const droppedOutput = droppedSession.invokeAsync(9, []);
   const droppedInput = droppedSession.invokeAsync(5, [33]);
@@ -1785,8 +2460,12 @@ const assert = require('node:assert/strict');
   await droppedInput;
   if (global.gc) global.gc();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(releasedStreams, [11, 22, 44, 33]);
-})().catch(error => { console.error(error); process.exitCode = 1; });
+  assert.deepEqual(releasedStreams, [11, 22, 44, 44, 33]);
+})().catch(error => { console.error(error); process.exitCode = 1; })
+  .finally(() => {
+    global.setTimeout = originalSetTimeout;
+    global.clearTimeout = originalClearTimeout;
+  });
 "#;
   let run = Command::new("node")
     .arg("--expose-gc")

@@ -11,12 +11,237 @@ use std::ffi::{c_void, CString};
 use std::ptr;
 use std::rc::Rc;
 use std::sync::{
-  atomic::{AtomicBool, Ordering},
+  atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
   Arc, Mutex, OnceLock, Weak,
 };
 
 use napi::bindgen_prelude::{JsValue, Object};
 use napi::{sys, Env, Error, Result, Status};
+
+/// Reference-counted lifetime gate shared by every pending settlement and
+/// invocation Host proxy.  Settlement contexts never retain a bare
+/// `SessionState` pointer: they consult this gate and observe `None` once the
+/// deadline (or the N-API finalizer) detaches the state.
+struct LifecycleGate {
+  env: sys::napi_env,
+  state: AtomicPtr<SessionState>,
+  detached: AtomicBool,
+  active_settlements: AtomicU32,
+  close_deferred: AtomicPtr<sys::napi_deferred__>,
+  settlement_refs: Mutex<Vec<Arc<PendingSessionRef>>>,
+  host_leases: Mutex<Vec<Weak<InvocationHostLease>>>,
+}
+
+struct PendingSessionRef {
+  env: sys::napi_env,
+  reference: AtomicPtr<sys::napi_ref__>,
+}
+
+impl PendingSessionRef {
+  fn new(env: sys::napi_env, reference: sys::napi_ref) -> Arc<Self> {
+    Arc::new(Self {
+      env,
+      reference: AtomicPtr::new(reference),
+    })
+  }
+
+  fn delete(&self) {
+    let reference = self.reference.swap(ptr::null_mut(), Ordering::AcqRel);
+    delete_reference(self.env, reference);
+  }
+}
+
+/// Per-native-invocation Host binding.  The lease is independent for each
+/// invocation so concurrent HostAndArguments futures cannot share or replace a
+/// session-level "current invocation" slot.
+struct InvocationHostLease {
+  gate: Arc<LifecycleGate>,
+  generation: u32,
+  active: AtomicBool,
+}
+
+impl InvocationHostLease {
+  fn is_active(&self) -> bool {
+    let _generation = self.generation;
+    self.active.load(Ordering::Acquire) && !self.gate.detached.load(Ordering::Acquire)
+  }
+}
+
+impl LifecycleGate {
+  fn new(env: sys::napi_env) -> Arc<Self> {
+    Arc::new(Self {
+      env,
+      state: AtomicPtr::new(ptr::null_mut()),
+      detached: AtomicBool::new(false),
+      active_settlements: AtomicU32::new(0),
+      close_deferred: AtomicPtr::new(ptr::null_mut()),
+      settlement_refs: Mutex::new(Vec::new()),
+      host_leases: Mutex::new(Vec::new()),
+    })
+  }
+
+  fn install_state(&self, state: *mut SessionState) -> bool {
+    if self.detached.load(Ordering::Acquire) {
+      return false;
+    }
+    self.state.store(state, Ordering::Release);
+    !self.detached.load(Ordering::Acquire)
+  }
+
+  fn state_ptr(&self) -> *mut SessionState {
+    self.state.load(Ordering::Acquire)
+  }
+
+  fn state(&self) -> Option<&'static SessionState> {
+    let state = self.state_ptr();
+    (!state.is_null()).then(|| unsafe { &*state })
+  }
+
+  fn register_settlement(&self) -> Result<()> {
+    loop {
+      if self.detached.load(Ordering::Acquire) {
+        return Err(Error::new(
+          Status::GenericFailure,
+          "UniFFI session lifecycle is detached",
+        ));
+      }
+      let current = self.active_settlements.load(Ordering::Acquire);
+      let next = current.checked_add(1).ok_or_else(|| {
+        Error::new(
+          Status::GenericFailure,
+          "too many pending UniFFI settlements",
+        )
+      })?;
+      if self
+        .active_settlements
+        .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+      {
+        if self.detached.load(Ordering::Acquire) {
+          self.active_settlements.fetch_sub(1, Ordering::AcqRel);
+          return Err(Error::new(
+            Status::GenericFailure,
+            "UniFFI session lifecycle detached during settlement registration",
+          ));
+        }
+        return Ok(());
+      }
+    }
+  }
+
+  fn finish_settlement(&self) {
+    let _ = self
+      .active_settlements
+      .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        value.checked_sub(1)
+      });
+  }
+
+  fn set_close_deferred(&self, deferred: sys::napi_deferred) {
+    self.close_deferred.store(deferred, Ordering::Release);
+    if self.detached.load(Ordering::Acquire) {
+      self.resolve_close();
+    }
+  }
+
+  fn resolve_close(&self) {
+    let deferred = self.close_deferred.swap(ptr::null_mut(), Ordering::AcqRel);
+    if deferred.is_null() || self.env.is_null() {
+      return;
+    }
+    clear_pending_exception(self.env);
+    let _ = unsafe {
+      sys::napi_resolve_deferred(
+        self.env,
+        deferred,
+        js_undefined(self.env).unwrap_or(ptr::null_mut()),
+      )
+    };
+  }
+
+  fn register_settlement_ref(&self, reference: Arc<PendingSessionRef>) -> bool {
+    let mut refs = self
+      .settlement_refs
+      .lock()
+      .expect("lifecycle settlement refs poisoned");
+    if self.detached.load(Ordering::Acquire) {
+      drop(refs);
+      reference.delete();
+      false
+    } else {
+      refs.push(reference);
+      true
+    }
+  }
+
+  fn unregister_settlement_ref(&self, reference: &Arc<PendingSessionRef>) {
+    let mut refs = self
+      .settlement_refs
+      .lock()
+      .expect("lifecycle settlement refs poisoned");
+    refs.retain(|candidate| !Arc::ptr_eq(candidate, reference));
+  }
+
+  fn detach_settlement_refs(&self) {
+    let refs = std::mem::take(
+      &mut *self
+        .settlement_refs
+        .lock()
+        .expect("lifecycle settlement refs poisoned"),
+    );
+    for reference in refs {
+      reference.delete();
+    }
+  }
+
+  fn new_host_lease(self: &Arc<Self>, generation: u32) -> Arc<InvocationHostLease> {
+    let lease = Arc::new(InvocationHostLease {
+      gate: self.clone(),
+      generation,
+      active: AtomicBool::new(true),
+    });
+    self
+      .host_leases
+      .lock()
+      .expect("lifecycle Host leases poisoned")
+      .push(Arc::downgrade(&lease));
+    lease
+  }
+
+  fn detach_host_leases(&self) {
+    let mut leases = self
+      .host_leases
+      .lock()
+      .expect("lifecycle Host leases poisoned");
+    leases.retain(|weak| {
+      weak.upgrade().is_some_and(|lease| {
+        lease.active.store(false, Ordering::Release);
+        false
+      })
+    });
+  }
+
+  /// Atomically invalidate all gate users before any N-API references are
+  /// released.  The returned pointer is used only by the current JS-thread
+  /// teardown path; settlement contexts never dereference it after this call.
+  fn detach(&self) -> *mut SessionState {
+    self.detached.store(true, Ordering::Release);
+    self.detach_host_leases();
+    let state = self.state.swap(ptr::null_mut(), Ordering::AcqRel);
+    self.detach_settlement_refs();
+    self.resolve_close();
+    state
+  }
+}
+
+// N-API callback contexts are only entered on their owning JS environment
+// thread.  The Arc itself can be dropped by a worker-thread future; dropping
+// it performs no N-API calls, so these marker impls are sound for the gate's
+// atomics/mutexes.
+unsafe impl Send for LifecycleGate {}
+unsafe impl Sync for LifecycleGate {}
+unsafe impl Send for PendingSessionRef {}
+unsafe impl Sync for PendingSessionRef {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionCallbackRetention {
@@ -475,10 +700,15 @@ struct CallbackKey {
 
 struct SessionState {
   env: sys::napi_env,
+  gate: Arc<LifecycleGate>,
   session_generation: u32,
+  node_timer: bool,
   host: Cell<sys::napi_ref>,
+  close_policy: napi_family_core::ClosePolicy,
+  deadline_timer: Cell<sys::napi_ref>,
   release_callback: Cell<sys::napi_ref>,
   operations: Vec<SessionOperation>,
+  closing: Cell<bool>,
   closed: Cell<bool>,
   next_invocation_id: Cell<u32>,
   pending_work: Cell<u32>,
@@ -516,7 +746,7 @@ impl SessionState {
   }
 
   fn ensure_open(&self) -> Result<()> {
-    if self.closed.get() {
+    if self.closing.get() || self.closed.get() || self.gate.detached.load(Ordering::Acquire) {
       Err(Error::new(
         Status::GenericFailure,
         "UniFFI backend session is closed",
@@ -527,8 +757,10 @@ impl SessionState {
   }
 
   fn begin_pending_work(&self) -> Result<()> {
+    self.gate.register_settlement()?;
     let pending = self.pending_work.get();
     let next = pending.checked_add(1).ok_or_else(|| {
+      self.gate.finish_settlement();
       Error::new(
         Status::GenericFailure,
         "too many pending UniFFI backend operations",
@@ -544,24 +776,23 @@ impl SessionState {
       return;
     }
     self.pending_work.set(pending - 1);
+    self.gate.finish_settlement();
     if pending == 1 {
       self.resolve_close_deferred();
     }
   }
 
   fn resolve_close_deferred(&self) {
-    let deferred = self.close_deferred.replace(ptr::null_mut());
-    if deferred.is_null() {
-      return;
+    self.clear_deadline_timer();
+    if self.closing.get()
+      && !self.closed.get()
+      && !self.gate.detached.load(Ordering::Acquire)
+      && self.pending_work.get() == 0
+    {
+      self.finalize_natural_close();
     }
-    clear_pending_exception(self.env);
-    let _ = unsafe {
-      sys::napi_resolve_deferred(
-        self.env,
-        deferred,
-        js_undefined(self.env).unwrap_or(ptr::null_mut()),
-      )
-    };
+    self.gate.resolve_close();
+    self.close_deferred.set(ptr::null_mut());
   }
 
   fn snapshot(&self) -> InvocationSnapshot {
@@ -1155,6 +1386,20 @@ impl SessionState {
       clear_pending_exception(self.env);
       return;
     }
+    if self.gate.detached.load(Ordering::Acquire) {
+      // The close Promise has already resolved, so a normal settlement would
+      // be rejected by the detached lifecycle gate.  Keep cancellation and
+      // release ordered with a gate-independent Promise reaction instead.
+      if self
+        .schedule_late_output_release(cancel_result, resource)
+        .is_err()
+      {
+        clear_pending_exception(self.env);
+        let _ = self.release_resource(resource, SessionResourceReceiver::OutputStream, false);
+        clear_pending_exception(self.env);
+      }
+      return;
+    }
     if self
       .remember_cancel_promise(resource, cancel_result)
       .is_err()
@@ -1173,6 +1418,111 @@ impl SessionState {
       let _ = self.release_resource(resource, SessionResourceReceiver::OutputStream, false);
       clear_pending_exception(self.env);
     }
+  }
+
+  fn schedule_late_output_release(
+    &self,
+    cancel_promise: sys::napi_value,
+    resource: sys::napi_value,
+  ) -> Result<()> {
+    let release_callback = self.resource_callbacks.release_output_stream.get();
+    if release_callback.is_null() {
+      let _ = self.release_resource(resource, SessionResourceReceiver::OutputStream, false);
+      return Ok(());
+    }
+    let resource_ref = PendingSessionRef::new(
+      self.env,
+      create_reference(self.env, resource, "late output cleanup resource")?,
+    );
+    let release_callback_value =
+      reference_value(self.env, release_callback, "output release callback")?;
+    let release_callback_ref = match create_reference(
+      self.env,
+      release_callback_value,
+      "late output cleanup callback",
+    ) {
+      Ok(reference) => PendingSessionRef::new(self.env, reference),
+      Err(error) => {
+        resource_ref.delete();
+        return Err(error);
+      }
+    };
+    let cleanup = Arc::new(LateOutputRelease {
+      resource: resource_ref,
+      release_callback: release_callback_ref,
+      settled: AtomicBool::new(false),
+    });
+    let fulfilled_context = Box::into_raw(Box::new(LateOutputReleaseContext {
+      cleanup: cleanup.clone(),
+    }));
+    let rejected_context = Box::into_raw(Box::new(LateOutputReleaseContext {
+      cleanup: cleanup.clone(),
+    }));
+    let fulfilled = match create_callback_function(
+      self.env,
+      "uniffi_late_output_cancel_fulfilled",
+      late_output_release_fulfilled,
+      fulfilled_context.cast(),
+      Some(finalize_late_output_release_context),
+    ) {
+      Ok(value) => value,
+      Err(error) => {
+        unsafe {
+          drop(Box::from_raw(fulfilled_context));
+          drop(Box::from_raw(rejected_context));
+        }
+        cleanup.resource.delete();
+        cleanup.release_callback.delete();
+        return Err(error);
+      }
+    };
+    let rejected = match create_callback_function(
+      self.env,
+      "uniffi_late_output_cancel_rejected",
+      late_output_release_rejected,
+      rejected_context.cast(),
+      Some(finalize_late_output_release_context),
+    ) {
+      Ok(value) => value,
+      Err(error) => {
+        unsafe {
+          drop(Box::from_raw(rejected_context));
+        }
+        cleanup.resource.delete();
+        cleanup.release_callback.delete();
+        return Err(error);
+      }
+    };
+    let then = match named_property(self.env, cancel_promise, "then") {
+      Ok(value) => value,
+      Err(error) => {
+        cleanup.resource.delete();
+        cleanup.release_callback.delete();
+        return Err(error);
+      }
+    };
+    if let Err(error) = call_function(self.env, cancel_promise, then, &[fulfilled, rejected]) {
+      cleanup.resource.delete();
+      cleanup.release_callback.delete();
+      return Err(error);
+    }
+    // The tracked lease has transferred ownership to `cleanup`; remove the
+    // original reference so finalizer cleanup cannot invoke release twice.
+    let tracked_index = {
+      let references = self.resource_references.borrow();
+      references.iter().position(|tracked| {
+        tracked.kind == SessionResourceReceiver::OutputStream
+          && reference_value(self.env, tracked.reference, "resource lease")
+            .ok()
+            .is_some_and(|existing| strict_equals(self.env, existing, resource))
+      })
+    };
+    if let Some(index) = tracked_index {
+      let tracked = self.resource_references.borrow_mut().swap_remove(index);
+      delete_reference(self.env, tracked.reference);
+      delete_reference(self.env, tracked.cancel_promise);
+    }
+    Ok(())
   }
 
   fn begin_output_cancel(
@@ -1285,25 +1635,68 @@ impl SessionState {
     })
   }
 
+  fn new_settlement_shared(
+    &self,
+    snapshot: Option<InvocationSnapshot>,
+    session_value: sys::napi_value,
+  ) -> Result<(
+    Rc<SettlementShared>,
+    Arc<PendingSessionRef>,
+    Arc<PendingSessionRef>,
+  )> {
+    let fulfilled_reference = PendingSessionRef::new(
+      self.env,
+      create_reference(self.env, session_value, "pending session")?,
+    );
+    if !self
+      .gate
+      .register_settlement_ref(fulfilled_reference.clone())
+    {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "session detached before Promise settlement registration",
+      ));
+    }
+    let rejected_reference = match create_reference(self.env, session_value, "pending session") {
+      Ok(reference) => PendingSessionRef::new(self.env, reference),
+      Err(error) => {
+        fulfilled_reference.delete();
+        self.gate.unregister_settlement_ref(&fulfilled_reference);
+        return Err(error);
+      }
+    };
+    if !self
+      .gate
+      .register_settlement_ref(rejected_reference.clone())
+    {
+      fulfilled_reference.delete();
+      self.gate.unregister_settlement_ref(&fulfilled_reference);
+      rejected_reference.delete();
+      return Err(Error::new(
+        Status::GenericFailure,
+        "session detached before Promise rejection registration",
+      ));
+    }
+    let shared = Rc::new(SettlementShared {
+      gate: self.gate.clone(),
+      settled: Cell::new(false),
+      snapshot: RefCell::new(snapshot),
+      session_references: RefCell::new(vec![
+        fulfilled_reference.clone(),
+        rejected_reference.clone(),
+      ]),
+    });
+    Ok((shared, fulfilled_reference, rejected_reference))
+  }
+
   fn attach_output_cancel_settlement(
     &self,
     promise: sys::napi_value,
     resource_reference: sys::napi_ref,
     session_value: sys::napi_value,
   ) -> Result<()> {
-    let shared = Rc::new(SettlementShared {
-      state: self as *const SessionState,
-      settled: Cell::new(false),
-      snapshot: RefCell::new(None),
-    });
-    let fulfilled_reference = create_reference(self.env, session_value, "pending session")?;
-    let rejected_reference = match create_reference(self.env, session_value, "pending session") {
-      Ok(reference) => reference,
-      Err(error) => {
-        delete_reference(self.env, fulfilled_reference);
-        return Err(error);
-      }
-    };
+    let (shared, fulfilled_reference, rejected_reference) =
+      self.new_settlement_shared(None, session_value)?;
     let fulfilled_context = Box::into_raw(Box::new(OutputCancelContext {
       shared: shared.clone(),
       session_reference: fulfilled_reference,
@@ -1326,8 +1719,8 @@ impl SessionState {
       unsafe {
         let fulfilled = Box::from_raw(fulfilled_context);
         let rejected = Box::from_raw(rejected_context);
-        delete_reference(self.env, fulfilled.session_reference);
-        delete_reference(self.env, rejected.session_reference);
+        fulfilled.session_reference.delete();
+        rejected.session_reference.delete();
       }
       error
     })?;
@@ -1342,7 +1735,7 @@ impl SessionState {
       shared.settled.set(true);
       unsafe {
         let rejected = Box::from_raw(rejected_context);
-        delete_reference(self.env, rejected.session_reference);
+        rejected.session_reference.delete();
       }
       error
     })?;
@@ -1442,6 +1835,12 @@ impl SessionState {
       }
     } else if call_result_is_error(self.env, result)? {
       self.rollback(snapshot);
+    } else if self.closing.get() || self.closed.get() || self.gate.detached.load(Ordering::Acquire)
+    {
+      // A synchronous native invocation may re-enter close() before returning.
+      // Its primitive result is still delivered, but resource/callback/input
+      // tracking must not create a fresh lease after teardown has begun.
+      self.release_late_result(result, kind, session_value);
     } else if let Err(error) = self.track_result_value(result, kind, &operation.callback_arguments)
     {
       self.rollback(snapshot);
@@ -1458,23 +1857,8 @@ impl SessionState {
     snapshot: InvocationSnapshot,
     session_value: sys::napi_value,
   ) -> Result<()> {
-    // Keep the JS session object (and therefore its wrapped SessionState)
-    // alive until each settlement callback function is finalized.  A raw
-    // SessionState pointer alone would become dangling if the caller dropped
-    // the session while this Promise was still pending.
-    let shared = Rc::new(SettlementShared {
-      state: self as *const SessionState,
-      settled: Cell::new(false),
-      snapshot: RefCell::new(Some(snapshot)),
-    });
-    let fulfilled_reference = create_reference(self.env, session_value, "pending session")?;
-    let rejected_reference = match create_reference(self.env, session_value, "pending session") {
-      Ok(reference) => reference,
-      Err(error) => {
-        delete_reference(self.env, fulfilled_reference);
-        return Err(error);
-      }
-    };
+    let (shared, fulfilled_reference, rejected_reference) =
+      self.new_settlement_shared(Some(snapshot), session_value)?;
     let fulfilled_context = Box::into_raw(Box::new(AsyncResultContext {
       shared: shared.clone(),
       session_reference: fulfilled_reference,
@@ -1500,8 +1884,8 @@ impl SessionState {
       unsafe {
         let fulfilled = Box::from_raw(fulfilled_context);
         let rejected = Box::from_raw(rejected_context);
-        delete_reference(self.env, fulfilled.session_reference);
-        delete_reference(self.env, rejected.session_reference);
+        fulfilled.session_reference.delete();
+        rejected.session_reference.delete();
       }
       error
     })?;
@@ -1517,7 +1901,7 @@ impl SessionState {
       shared.snapshot.borrow_mut().take();
       unsafe {
         let rejected = Box::from_raw(rejected_context);
-        delete_reference(self.env, rejected.session_reference);
+        rejected.session_reference.delete();
       }
       error
     })?;
@@ -1554,19 +1938,22 @@ impl SessionState {
         return Err(error);
       }
     } else if cancel || input_step_is_terminal(self.env, result)? {
-      self.release_input_stream(id)?;
+      if let Some(release) = self.release_input_stream(id)? {
+        if is_thenable(self.env, release)? {
+          self.schedule_cleanup_promise(release)?;
+        }
+      }
     }
     Ok(result)
   }
 
-  fn release_input_stream(&self, id: u32) -> Result<()> {
+  fn release_input_stream(&self, id: u32) -> Result<Option<sys::napi_value>> {
     if !self.input_streams.borrow_mut().remove(&id) {
-      return Ok(());
+      return Ok(None);
     }
     self.released_input_streams.borrow_mut().insert(id);
     let stream_id = js_u32(self.env, id)?;
-    let _ = self.call_host("releaseInputStream", &[stream_id])?;
-    Ok(())
+    Ok(Some(self.call_host("releaseInputStream", &[stream_id])?))
   }
 
   fn attach_input_settlement(
@@ -1576,19 +1963,8 @@ impl SessionState {
     cancel: bool,
     session_value: sys::napi_value,
   ) -> Result<()> {
-    let shared = Rc::new(SettlementShared {
-      state: self as *const SessionState,
-      settled: Cell::new(false),
-      snapshot: RefCell::new(None),
-    });
-    let fulfilled_reference = create_reference(self.env, session_value, "pending session")?;
-    let rejected_reference = match create_reference(self.env, session_value, "pending session") {
-      Ok(reference) => reference,
-      Err(error) => {
-        delete_reference(self.env, fulfilled_reference);
-        return Err(error);
-      }
-    };
+    let (shared, fulfilled_reference, rejected_reference) =
+      self.new_settlement_shared(None, session_value)?;
     let fulfilled_context = Box::into_raw(Box::new(InputSettlementContext {
       shared: shared.clone(),
       session_reference: fulfilled_reference,
@@ -1613,8 +1989,8 @@ impl SessionState {
       unsafe {
         let fulfilled = Box::from_raw(fulfilled_context);
         let rejected = Box::from_raw(rejected_context);
-        delete_reference(self.env, fulfilled.session_reference);
-        delete_reference(self.env, rejected.session_reference);
+        fulfilled.session_reference.delete();
+        rejected.session_reference.delete();
       }
       error
     })?;
@@ -1629,7 +2005,7 @@ impl SessionState {
       shared.settled.set(true);
       unsafe {
         let rejected = Box::from_raw(rejected_context);
-        delete_reference(self.env, rejected.session_reference);
+        rejected.session_reference.delete();
       }
       error
     })?;
@@ -1706,7 +2082,12 @@ impl SessionState {
             args.len() + usize::from(operation.native_call == SessionNativeCall::HostAndArguments),
           );
           if operation.native_call == SessionNativeCall::HostAndArguments {
-            native_args.push(self.host_value()?);
+            let lease = self.gate.new_host_lease(self.session_generation);
+            native_args.push(create_invocation_host_proxy(
+              self.env,
+              self.host_value()?,
+              lease,
+            )?);
           }
           if operation.callback_transfer {
             native_args.push(js_u32(self.env, self.session_generation)?);
@@ -1742,13 +2123,29 @@ impl SessionState {
       SessionOperationDispatch::CallbackHostAsync {
         callback_type_id,
         method_id,
-      } => match self.dispatch_callback_host(callback_type_id, method_id, args, true) {
-        Ok(result) => Ok(result),
-        Err(error) => {
-          self.rollback(snapshot);
-          Err(error)
+      } => {
+        let result = match self.dispatch_callback_host(callback_type_id, method_id, args, true) {
+          Ok(result) => result,
+          Err(error) => {
+            self.rollback(snapshot);
+            return Err(error);
+          }
+        };
+        if is_thenable(self.env, result)? {
+          if let Err(error) = self.begin_pending_work() {
+            self.rollback(snapshot);
+            return Err(error);
+          }
+          if let Err(error) =
+            self.attach_promise_settlement(result, None, Vec::new(), snapshot.clone(), this)
+          {
+            self.finish_pending_work();
+            self.rollback(snapshot);
+            return Err(error);
+          }
         }
-      },
+        Ok(result)
+      }
       SessionOperationDispatch::InputStreamHostPull => {
         let raw_result = (|| {
           let stream_value = *args
@@ -1834,7 +2231,7 @@ impl SessionState {
   }
 
   fn close(&self) {
-    if self.closed.replace(true) {
+    if self.closing.replace(true) {
       return;
     }
     let callbacks = std::mem::take(&mut *self.callback_leases.borrow_mut());
@@ -1860,7 +2257,12 @@ impl SessionState {
     for stream_id in streams {
       if let Ok(stream_id) = js_u32(self.env, stream_id) {
         clear_pending_exception(self.env);
-        let _ = self.call_host("releaseInputStream", &[stream_id]);
+        if let Ok(result) = self.call_host("releaseInputStream", &[stream_id]) {
+          if is_thenable(self.env, result).unwrap_or(false) {
+            let _ = self.schedule_cleanup_promise(result);
+          }
+        }
+        clear_pending_exception(self.env);
       }
     }
     let resources = self
@@ -1873,9 +2275,36 @@ impl SessionState {
           .map(|value| (value, tracked.kind))
       })
       .collect::<Vec<_>>();
+    let undefined = js_undefined(self.env).unwrap_or(ptr::null_mut());
     for (resource, kind) in resources {
-      let _ = self.release_resource(resource, kind, false);
+      if kind == SessionResourceReceiver::OutputStream
+        && !self.resource_callbacks.cancel_output_stream.get().is_null()
+        && self.output_cancel_is_new(resource)
+      {
+        match self.release_resource(resource, kind, true) {
+          Ok(Some(cancel)) if is_thenable(self.env, cancel).unwrap_or(false) => {
+            let _ = self.remember_cancel_promise(resource, cancel);
+            let _ = self.begin_output_cancel(resource, cancel, undefined);
+          }
+          Ok(_) | Err(_) => {
+            let _ = self.release_resource(resource, kind, false);
+          }
+        }
+      } else {
+        let _ = self.release_resource(resource, kind, false);
+      }
+      clear_pending_exception(self.env);
     }
+  }
+
+  fn schedule_cleanup_promise(&self, promise: sys::napi_value) -> Result<()> {
+    self.begin_pending_work()?;
+    let undefined = js_undefined(self.env)?;
+    if let Err(error) = self.attach_input_settlement(promise, 0, true, undefined) {
+      self.finish_pending_work();
+      return Err(error);
+    }
+    Ok(())
   }
 
   fn close_promise(&self) -> Result<sys::napi_value> {
@@ -1900,6 +2329,10 @@ impl SessionState {
     };
     self.close_promise.set(promise_reference);
     self.close_deferred.set(deferred);
+    self.gate.set_close_deferred(deferred);
+    if self.node_timer {
+      self.start_deadline_timer()?;
+    }
     if self.pending_work.get() == 0 {
       self.resolve_close_deferred();
     }
@@ -1907,7 +2340,16 @@ impl SessionState {
   }
 
   fn cleanup_references(&self) {
-    self.close();
+    if !self.closing.get() && !self.gate.detached.load(Ordering::Acquire) {
+      self.close();
+    }
+    if !self.gate.detached.load(Ordering::Acquire) {
+      let _ = self.gate.detach();
+      self.closed.set(true);
+      self.clear_deadline_timer();
+    } else {
+      self.clear_deadline_timer();
+    }
     // The TSFN context owns all data needed by its callback.  During ordinary
     // explicit close the JS method shuts the TSFN down below; during Node
     // environment cleanup the TSFN finalizer marks the queue detached first,
@@ -1930,6 +2372,159 @@ impl SessionState {
       delete_reference(self.env, callback.replace(ptr::null_mut()));
     }
   }
+
+  fn start_deadline_timer(&self) -> Result<()> {
+    if !self.deadline_timer.get().is_null() {
+      return Ok(());
+    }
+    let global = get_global(self.env)?;
+    let set_timeout = named_property(self.env, global, "setTimeout")?;
+    let context = Box::into_raw(Box::new(DeadlineContext {
+      gate: self.gate.clone(),
+    }));
+    let callback = match create_callback_function(
+      self.env,
+      "uniffi_close_deadline",
+      deadline_timer_callback,
+      context.cast(),
+      Some(finalize_deadline_context),
+    ) {
+      Ok(callback) => callback,
+      Err(error) => {
+        unsafe {
+          drop(Box::from_raw(context));
+        }
+        return Err(error);
+      }
+    };
+    let delay = js_u32(self.env, self.close_policy.grace_ms)?;
+    let timer = call_function(self.env, global, set_timeout, &[callback, delay])?;
+    // Node timer objects expose unref(); an absent method is a backend error so
+    // a configured grace period can never accidentally keep the process alive.
+    let unref = named_property(self.env, timer, "unref")?;
+    let _ = call_function(self.env, timer, unref, &[])?;
+    self
+      .deadline_timer
+      .set(create_reference(self.env, timer, "close deadline timer")?);
+    Ok(())
+  }
+
+  fn clear_deadline_timer(&self) {
+    let reference = self.deadline_timer.replace(ptr::null_mut());
+    if reference.is_null() {
+      return;
+    }
+    if let Ok(timer) = reference_value(self.env, reference, "close deadline timer") {
+      if let Ok(global) = get_global(self.env) {
+        if let Ok(clear_timeout) = named_property(self.env, global, "clearTimeout") {
+          clear_pending_exception(self.env);
+          let _ = call_function(self.env, global, clear_timeout, &[timer]);
+          clear_pending_exception(self.env);
+        }
+      }
+    }
+    delete_reference(self.env, reference);
+  }
+
+  fn deadline_detach(&self) {
+    if self.gate.state_ptr() != (self as *const SessionState).cast_mut() {
+      return;
+    }
+    // `detach` atomically clears the pointer observed by every settlement and
+    // Host lease before this method drops any N-API references.
+    let _ = self.gate.detach();
+    self.closing.set(true);
+    self.closed.set(true);
+    self.clear_deadline_timer();
+    self.callback_release_queue.claim_all_active();
+    self.callback_release_queue.take_pending();
+    self.callback_release_queue.shutdown();
+    let transfers = std::mem::take(&mut *self.callback_transfers.borrow_mut());
+    for transfer_id in transfers {
+      discard_callback_transfer(self.session_generation, transfer_id);
+    }
+    self.callback_leases.borrow_mut().clear();
+    self.callback_owners.borrow_mut().clear();
+    self.input_streams.borrow_mut().clear();
+    let resources = std::mem::take(&mut *self.resource_references.borrow_mut());
+    for tracked in resources {
+      let resource = reference_value(self.env, tracked.reference, "resource lease").ok();
+      delete_reference(self.env, tracked.reference);
+      delete_reference(self.env, tracked.cancel_promise);
+      if let Some(resource) = resource {
+        match tracked.kind {
+          SessionResourceReceiver::Object => {
+            self.release_untracked_resource(resource, tracked.kind)
+          }
+          SessionResourceReceiver::OutputStream if !tracked.cancel_pending => {
+            self.release_untracked_resource(resource, tracked.kind)
+          }
+          // A cancel hook that is still pending owns the output cleanup
+          // ordering.  Detach invalidates its token and deliberately drops
+          // the native reference; a late settlement cannot release twice or
+          // re-enter the Host/application.
+          SessionResourceReceiver::OutputStream => {}
+          SessionResourceReceiver::InputStream => {}
+        }
+      }
+    }
+    for operation in &self.operations {
+      delete_reference(self.env, operation.callback.replace(ptr::null_mut()));
+    }
+    delete_reference(self.env, self.host.replace(ptr::null_mut()));
+    delete_reference(self.env, self.release_callback.replace(ptr::null_mut()));
+    // Keep the native close Promise reference until the wrapped session's
+    // finalizer so a repeated close() after deadline returns the exact same
+    // Promise object.
+    self.close_deferred.set(ptr::null_mut());
+    // Keep resource hook references until cleanup_references() so late
+    // object/output results can still run their native release hooks after
+    // detach.  The session finalizer deletes them exactly once.
+  }
+
+  /// Natural close completion follows the same detach transition as the
+  /// deadline path, but is reached only after every counted settlement has
+  /// finished.  Keeping this transition explicit revokes all retained Host
+  /// proxies and drops native references before resolving close().
+  fn finalize_natural_close(&self) {
+    if self.gate.state_ptr() != (self as *const SessionState).cast_mut() {
+      return;
+    }
+    let _ = self.gate.detach();
+    self.closing.set(true);
+    self.closed.set(true);
+    self.callback_release_queue.claim_all_active();
+    self.callback_release_queue.take_pending();
+    self.callback_release_queue.shutdown();
+    let transfers = std::mem::take(&mut *self.callback_transfers.borrow_mut());
+    for transfer_id in transfers {
+      discard_callback_transfer(self.session_generation, transfer_id);
+    }
+    self.callback_leases.borrow_mut().clear();
+    self.callback_owners.borrow_mut().clear();
+    self.input_streams.borrow_mut().clear();
+    let resources = std::mem::take(&mut *self.resource_references.borrow_mut());
+    for tracked in resources {
+      let resource = reference_value(self.env, tracked.reference, "resource lease").ok();
+      delete_reference(self.env, tracked.reference);
+      delete_reference(self.env, tracked.cancel_promise);
+      if let Some(resource) = resource {
+        if tracked.kind == SessionResourceReceiver::Object
+          || (tracked.kind == SessionResourceReceiver::OutputStream && !tracked.cancel_pending)
+        {
+          self.release_untracked_resource(resource, tracked.kind);
+        }
+      }
+    }
+    for operation in &self.operations {
+      delete_reference(self.env, operation.callback.replace(ptr::null_mut()));
+    }
+    delete_reference(self.env, self.host.replace(ptr::null_mut()));
+    delete_reference(self.env, self.release_callback.replace(ptr::null_mut()));
+    // Keep resource hook references until cleanup_references() so late
+    // object/output results can still run their native release hooks after
+    // detach.  The session finalizer deletes them exactly once.
+  }
 }
 
 /// Build the session object returned by the sole generated factory export.
@@ -1937,10 +2532,12 @@ pub fn create_backend_session(
   env: &Env,
   host: Object<'static>,
   flavor: &str,
+  close_policy: napi_family_core::ClosePolicy,
   descriptors: Vec<SessionOperationDescriptor>,
   resource_callbacks: SessionResourceCallbacks,
 ) -> Result<Object<'static>> {
   let session_generation = allocate_session_generation()?;
+  let gate = LifecycleGate::new(env.raw());
   let host_reference = create_reference(env.raw(), host.raw(), "Host")?;
   let release_callback_reference = create_reference(
     env.raw(),
@@ -1982,11 +2579,16 @@ pub fn create_backend_session(
 
   let state = Box::new(SessionState {
     env: env.raw(),
+    gate: gate.clone(),
     session_generation,
+    node_timer: flavor == "node",
     host: Cell::new(host_reference),
     release_callback: Cell::new(release_callback_reference),
     operations,
+    closing: Cell::new(false),
     closed: Cell::new(false),
+    close_policy,
+    deadline_timer: Cell::new(ptr::null_mut()),
     next_invocation_id: Cell::new(0),
     pending_work: Cell::new(0),
     close_deferred: Cell::new(ptr::null_mut()),
@@ -2028,6 +2630,14 @@ pub fn create_backend_session(
   let mut session = Object::new(env)?;
   let raw_session = session.raw();
   let state = Box::into_raw(state);
+  if !gate.install_state(state) {
+    let state = unsafe { Box::from_raw(state) };
+    state.cleanup_references();
+    return Err(Error::new(
+      Status::GenericFailure,
+      "session lifecycle gate detached during creation",
+    ));
+  }
   let callback_release_queue = unsafe { (&*state).callback_release_queue.clone() };
   let callback_release_tsfn =
     match create_callback_release_tsfn(env.raw(), host.raw(), callback_release_queue.clone()) {
@@ -2324,9 +2934,6 @@ unsafe extern "C" fn session_close(
     let (this, _) = callback_args(env, info, 0)?;
     let state = state(env, this)?;
     state.close();
-    // An explicit JS close owns the session lifetime, so it can safely abort
-    // and unref the scheduler after all callback releases have been drained.
-    state.callback_release_queue.shutdown();
     state.close_promise()
   })
 }
@@ -2445,6 +3052,30 @@ fn named_property(
     sys::napi_get_named_property(env, object, name.as_ptr(), &mut value)
   })?;
   Ok(value)
+}
+
+fn get_property(
+  env: sys::napi_env,
+  object: sys::napi_value,
+  key: sys::napi_value,
+) -> Result<sys::napi_value> {
+  let mut value = ptr::null_mut();
+  napi::check_status!(unsafe { sys::napi_get_property(env, object, key, &mut value) })?;
+  Ok(value)
+}
+
+fn set_property(
+  env: sys::napi_env,
+  object: sys::napi_value,
+  name: &str,
+  value: sys::napi_value,
+) -> Result<()> {
+  let name = CString::new(name)?;
+  let mut key = ptr::null_mut();
+  napi::check_status!(unsafe {
+    sys::napi_create_string_utf8(env, name.as_ptr(), name.as_bytes().len() as isize, &mut key)
+  })?;
+  napi::check_status!(unsafe { sys::napi_set_property(env, object, key, value) })
 }
 
 fn call_function(
@@ -2650,6 +3281,18 @@ fn js_undefined(env: sys::napi_env) -> Result<sys::napi_value> {
   Ok(value)
 }
 
+fn get_global(env: sys::napi_env) -> Result<sys::napi_value> {
+  let mut global = ptr::null_mut();
+  napi::check_status!(unsafe { sys::napi_get_global(env, &mut global) })?;
+  Ok(global)
+}
+
+fn create_plain_object(env: sys::napi_env) -> Result<sys::napi_value> {
+  let mut object = ptr::null_mut();
+  napi::check_status!(unsafe { sys::napi_create_object(env, &mut object) })?;
+  Ok(object)
+}
+
 fn resolved_promise(env: sys::napi_env) -> Result<sys::napi_value> {
   let mut deferred = ptr::null_mut();
   let mut promise = ptr::null_mut();
@@ -2660,28 +3303,314 @@ fn resolved_promise(env: sys::napi_env) -> Result<sys::napi_value> {
 
 struct AsyncResultContext {
   shared: Rc<SettlementShared>,
-  session_reference: sys::napi_ref,
+  session_reference: Arc<PendingSessionRef>,
   kind: Option<SessionResourceReceiver>,
   callback_arguments: Vec<SessionCallbackArgument>,
 }
 
 struct InputSettlementContext {
   shared: Rc<SettlementShared>,
-  session_reference: sys::napi_ref,
+  session_reference: Arc<PendingSessionRef>,
   stream_id: u32,
   cancel: bool,
 }
 
 struct OutputCancelContext {
   shared: Rc<SettlementShared>,
-  session_reference: sys::napi_ref,
+  session_reference: Arc<PendingSessionRef>,
   resource_reference: sys::napi_ref,
 }
 
+/// Cleanup state for an output produced after the lifecycle gate detached.
+/// The ordinary cancel settlement cannot register against a detached gate;
+/// this small Promise reaction therefore owns independent N-API references
+/// and invokes release only after the asynchronous cancel hook settles.
+struct LateOutputRelease {
+  resource: Arc<PendingSessionRef>,
+  release_callback: Arc<PendingSessionRef>,
+  settled: AtomicBool,
+}
+
+struct LateOutputReleaseContext {
+  cleanup: Arc<LateOutputRelease>,
+}
+
+impl Drop for LateOutputRelease {
+  fn drop(&mut self) {
+    // If both Promise reactions are finalized without either callback
+    // running, reclaim the independent refs instead of leaking them until
+    // environment teardown.  `PendingSessionRef::delete` is idempotent, so
+    // the normal settlement path and this fallback cannot double-delete.
+    self.resource.delete();
+    self.release_callback.delete();
+  }
+}
+
 struct SettlementShared {
-  state: *const SessionState,
+  gate: Arc<LifecycleGate>,
   settled: Cell<bool>,
   snapshot: RefCell<Option<InvocationSnapshot>>,
+  session_references: RefCell<Vec<Arc<PendingSessionRef>>>,
+}
+
+struct DeadlineContext {
+  gate: Arc<LifecycleGate>,
+}
+
+struct HostProxyGetContext {
+  lease: Arc<InvocationHostLease>,
+  target: Arc<PendingSessionRef>,
+}
+
+struct HostProxyMethodContext {
+  lease: Arc<InvocationHostLease>,
+  target: Arc<PendingSessionRef>,
+  method: Arc<PendingSessionRef>,
+}
+
+unsafe extern "C" fn host_proxy_get(
+  env: sys::napi_env,
+  info: sys::napi_callback_info,
+) -> sys::napi_value {
+  callback_result(env, || {
+    let (args, data) = callback_args_with_data(env, info, 3)?;
+    let context = unsafe { &*(data.cast::<HostProxyGetContext>()) };
+    if !context.lease.is_active() {
+      return js_undefined(env);
+    }
+    let target = reference_value(
+      env,
+      context.target.reference.load(Ordering::Acquire),
+      "Host proxy target",
+    )?;
+    let value = get_property(env, target, args[1])?;
+    let mut value_type = sys::ValueType::napi_undefined;
+    napi::check_status!(unsafe { sys::napi_typeof(env, value, &mut value_type) })?;
+    if value_type != sys::ValueType::napi_function {
+      return Ok(value);
+    }
+    let method = PendingSessionRef::new(env, create_reference(env, value, "Host proxy method")?);
+    // Each captured method gets its own target reference.  The getter and
+    // every method wrapper may be finalized independently by V8; sharing the
+    // getter's Arc would let one method finalizer delete the host reference
+    // still needed by another wrapper (or by a later property lookup).
+    let method_target = PendingSessionRef::new(
+      env,
+      match create_reference(env, target, "Host proxy method target") {
+        Ok(reference) => reference,
+        Err(error) => {
+          method.delete();
+          return Err(error);
+        }
+      },
+    );
+    if !context.lease.gate.register_settlement_ref(method.clone()) {
+      method.delete();
+      method_target.delete();
+      return js_undefined(env);
+    }
+    if !context
+      .lease
+      .gate
+      .register_settlement_ref(method_target.clone())
+    {
+      method.delete();
+      method_target.delete();
+      context.lease.gate.unregister_settlement_ref(&method);
+      return js_undefined(env);
+    }
+    let method_context = Box::into_raw(Box::new(HostProxyMethodContext {
+      lease: context.lease.clone(),
+      target: method_target,
+      method,
+    }));
+    let method_result = create_callback_function(
+      env,
+      "uniffi_host_proxy_method",
+      host_proxy_method,
+      method_context.cast(),
+      Some(finalize_host_proxy_method),
+    );
+    match method_result {
+      Ok(value) => Ok(value),
+      Err(error) => {
+        // Callback creation can fail after both refs have been registered;
+        // reclaim the context and unregister each independent reference on
+        // this error path just as their finalizer would.
+        let context = unsafe { Box::from_raw(method_context.cast::<HostProxyMethodContext>()) };
+        context.target.delete();
+        context.method.delete();
+        context
+          .lease
+          .gate
+          .unregister_settlement_ref(&context.target);
+        context
+          .lease
+          .gate
+          .unregister_settlement_ref(&context.method);
+        Err(error)
+      }
+    }
+  })
+}
+
+unsafe extern "C" fn host_proxy_method(
+  env: sys::napi_env,
+  info: sys::napi_callback_info,
+) -> sys::napi_value {
+  callback_result(env, || {
+    let (args, data) = callback_args_dynamic(env, info)?;
+    let context = unsafe { &*(data.cast::<HostProxyMethodContext>()) };
+    if !context.lease.is_active() {
+      return js_undefined(env);
+    }
+    let target = reference_value(
+      env,
+      context.target.reference.load(Ordering::Acquire),
+      "Host proxy target",
+    )?;
+    let method = reference_value(
+      env,
+      context.method.reference.load(Ordering::Acquire),
+      "Host proxy method",
+    )?;
+    call_function(env, target, method, &args)
+  })
+}
+
+unsafe extern "C" fn finalize_host_proxy_get(
+  _env: sys::napi_env,
+  data: *mut c_void,
+  _hint: *mut c_void,
+) {
+  if !data.is_null() {
+    let context = unsafe { Box::from_raw(data.cast::<HostProxyGetContext>()) };
+    context.target.delete();
+    context
+      .lease
+      .gate
+      .unregister_settlement_ref(&context.target);
+  }
+}
+
+unsafe extern "C" fn finalize_host_proxy_method(
+  _env: sys::napi_env,
+  data: *mut c_void,
+  _hint: *mut c_void,
+) {
+  if !data.is_null() {
+    let context = unsafe { Box::from_raw(data.cast::<HostProxyMethodContext>()) };
+    context.target.delete();
+    context.method.delete();
+    context
+      .lease
+      .gate
+      .unregister_settlement_ref(&context.target);
+    context
+      .lease
+      .gate
+      .unregister_settlement_ref(&context.method);
+  }
+}
+
+fn create_invocation_host_proxy(
+  env: sys::napi_env,
+  host: sys::napi_value,
+  lease: Arc<InvocationHostLease>,
+) -> Result<sys::napi_value> {
+  let target = PendingSessionRef::new(env, create_reference(env, host, "Host proxy target")?);
+  if !lease.gate.register_settlement_ref(target.clone()) {
+    target.delete();
+    return Err(Error::new(Status::GenericFailure, "Host proxy detached"));
+  }
+  let get_context = Box::into_raw(Box::new(HostProxyGetContext {
+    lease: lease.clone(),
+    target: target.clone(),
+  }));
+  let get = match create_callback_function(
+    env,
+    "uniffi_host_proxy_get",
+    host_proxy_get,
+    get_context.cast(),
+    Some(finalize_host_proxy_get),
+  ) {
+    Ok(value) => value,
+    Err(error) => {
+      target.delete();
+      lease.gate.unregister_settlement_ref(&target);
+      unsafe {
+        drop(Box::from_raw(get_context));
+      }
+      return Err(error);
+    }
+  };
+  let handler = create_plain_object(env)?;
+  set_property(env, handler, "get", get)?;
+  let global = get_global(env)?;
+  let proxy_constructor = named_property(env, global, "Proxy")?;
+  let mut argv = [host, handler];
+  let mut proxy = ptr::null_mut();
+  napi::check_status!(unsafe {
+    sys::napi_new_instance(
+      env,
+      proxy_constructor,
+      argv.len(),
+      argv.as_mut_ptr(),
+      &mut proxy,
+    )
+  })?;
+  Ok(proxy)
+}
+
+unsafe extern "C" fn deadline_timer_callback(
+  env: sys::napi_env,
+  info: sys::napi_callback_info,
+) -> sys::napi_value {
+  let (_, data) = match callback_args_with_data(env, info, 0) {
+    Ok(value) => value,
+    Err(_) => return ptr::null_mut(),
+  };
+  let context = unsafe { &*(data.cast::<DeadlineContext>()) };
+  if let Some(state) = context.gate.state() {
+    state.deadline_detach();
+  } else {
+    context.gate.detach_settlement_refs();
+    context.gate.resolve_close();
+  }
+  js_undefined(env).unwrap_or(ptr::null_mut())
+}
+
+unsafe extern "C" fn finalize_deadline_context(
+  _env: sys::napi_env,
+  data: *mut c_void,
+  _hint: *mut c_void,
+) {
+  if !data.is_null() {
+    drop(unsafe { Box::from_raw(data.cast::<DeadlineContext>()) });
+  }
+}
+
+impl SettlementShared {
+  fn state(&self) -> Option<&'static SessionState> {
+    self.gate.state()
+  }
+
+  fn release_session_references(&self) {
+    let references = std::mem::take(&mut *self.session_references.borrow_mut());
+    for reference in references {
+      reference.delete();
+      self.gate.unregister_settlement_ref(&reference);
+    }
+  }
+
+  fn finish(&self) {
+    self.release_session_references();
+    if let Some(state) = self.state() {
+      state.finish_pending_work();
+    } else {
+      self.gate.finish_settlement();
+    }
+  }
 }
 
 unsafe extern "C" fn async_result_fulfilled(
@@ -2694,16 +3623,20 @@ unsafe extern "C" fn async_result_fulfilled(
     if context.shared.settled.replace(true) {
       return js_undefined(env);
     }
-    let state = (!context.shared.state.is_null()).then(|| unsafe { &*context.shared.state });
+    let state = context.shared.state();
     let outcome = if let Some(state) = state {
-      if state.closed.get() {
+      if state.closing.get() || state.closed.get() {
         // close() has already drained every public lease and shut down the
         // callback release TSFN.  Do not run callback/input tracking for this
         // late result.  Native object/output values still own a native handle,
         // so release that handle directly without registering a new lease.
         context.shared.snapshot.borrow_mut().take();
-        let session_value = reference_value(env, context.session_reference, "pending session")
-          .unwrap_or_else(|_| js_undefined(env).unwrap_or(ptr::null_mut()));
+        let session_value = reference_value(
+          env,
+          context.session_reference.reference.load(Ordering::Acquire),
+          "pending session",
+        )
+        .unwrap_or_else(|_| js_undefined(env).unwrap_or(ptr::null_mut()));
         state.release_late_result(args[0], context.kind, session_value);
         clear_pending_exception(env);
         Ok(())
@@ -2738,9 +3671,7 @@ unsafe extern "C" fn async_result_fulfilled(
     } else {
       Ok(())
     };
-    if let Some(state) = state {
-      state.finish_pending_work();
-    }
+    context.shared.finish();
     outcome?;
     js_undefined(env)
   })
@@ -2758,16 +3689,15 @@ unsafe extern "C" fn async_result_rejected(
   if context.shared.settled.replace(true) {
     return js_undefined(env).unwrap_or(ptr::null_mut());
   }
-  if !context.shared.state.is_null() {
-    let state = unsafe { &*context.shared.state };
+  if let Some(state) = context.shared.state() {
     let snapshot = context.shared.snapshot.borrow_mut().take();
-    if !state.closed.get() {
+    if !state.closing.get() && !state.closed.get() {
       if let Some(snapshot) = snapshot {
         state.rollback(snapshot);
       }
     }
-    state.finish_pending_work();
   }
+  context.shared.finish();
   js_undefined(env).unwrap_or(ptr::null_mut())
 }
 
@@ -2781,15 +3711,16 @@ unsafe extern "C" fn input_settlement_fulfilled(
     if context.shared.settled.replace(true) {
       return js_undefined(env);
     }
-    let result = if !context.shared.state.is_null() {
-      let state = unsafe { &*context.shared.state };
-      let terminal = if state.closed.get() || context.cancel {
+    let result = if let Some(state) = context.shared.state() {
+      let terminal = if state.closing.get() || state.closed.get() || context.cancel {
         Ok(true)
       } else {
         input_step_is_terminal(env, args[0])
       };
       match terminal {
-        Ok(true) if !state.closed.get() => state.release_input_stream(context.stream_id),
+        Ok(true) if !state.closing.get() && !state.closed.get() => {
+          state.release_input_stream(context.stream_id).map(|_| ())
+        }
         Ok(_) => Ok(()),
         Err(error) => {
           clear_pending_exception(env);
@@ -2800,10 +3731,7 @@ unsafe extern "C" fn input_settlement_fulfilled(
     } else {
       Ok(())
     };
-    if !context.shared.state.is_null() {
-      let state = unsafe { &*context.shared.state };
-      state.finish_pending_work();
-    }
+    context.shared.finish();
     result?;
     js_undefined(env)
   })
@@ -2821,13 +3749,12 @@ unsafe extern "C" fn input_settlement_rejected(
   if context.shared.settled.replace(true) {
     return js_undefined(env).unwrap_or(ptr::null_mut());
   }
-  if !context.shared.state.is_null() {
-    let state = unsafe { &*context.shared.state };
-    if !state.closed.get() {
+  if let Some(state) = context.shared.state() {
+    if !state.closing.get() && !state.closed.get() {
       let _ = state.release_input_stream(context.stream_id);
     }
-    state.finish_pending_work();
   }
+  context.shared.finish();
   js_undefined(env).unwrap_or(ptr::null_mut())
 }
 
@@ -2841,11 +3768,10 @@ unsafe extern "C" fn output_cancel_fulfilled(
     if context.shared.settled.replace(true) {
       return js_undefined(env);
     }
-    if !context.shared.state.is_null() {
-      let state = unsafe { &*context.shared.state };
+    if let Some(state) = context.shared.state() {
       state.complete_output_cancel(context.resource_reference)?;
-      state.finish_pending_work();
     }
+    context.shared.finish();
     js_undefined(env)
   })
 }
@@ -2862,65 +3788,128 @@ unsafe extern "C" fn output_cancel_rejected(
   if context.shared.settled.replace(true) {
     return js_undefined(env).unwrap_or(ptr::null_mut());
   }
-  if !context.shared.state.is_null() {
-    let state = unsafe { &*context.shared.state };
+  if let Some(state) = context.shared.state() {
     let _ = state.complete_output_cancel(context.resource_reference);
-    state.finish_pending_work();
   }
+  context.shared.finish();
   js_undefined(env).unwrap_or(ptr::null_mut())
 }
 
-unsafe extern "C" fn finalize_async_result_context(
+impl LateOutputRelease {
+  fn release(&self, env: sys::napi_env) -> Result<()> {
+    if self.settled.swap(true, Ordering::AcqRel) {
+      return Ok(());
+    }
+    let result = (|| {
+      let resource = reference_value(
+        env,
+        self.resource.reference.load(Ordering::Acquire),
+        "late output cleanup resource",
+      )?;
+      let callback = reference_value(
+        env,
+        self.release_callback.reference.load(Ordering::Acquire),
+        "late output cleanup callback",
+      )?;
+      let handle = named_property(env, resource, "handle")?;
+      call_function(env, resource, callback, &[handle]).map(|_| ())
+    })();
+    clear_pending_exception(env);
+    self.resource.delete();
+    self.release_callback.delete();
+    result
+  }
+}
+
+unsafe extern "C" fn late_output_release_fulfilled(
   env: sys::napi_env,
+  info: sys::napi_callback_info,
+) -> sys::napi_value {
+  callback_result(env, || {
+    let (_, data) = callback_args_with_data(env, info, 1)?;
+    let context = unsafe { &*(data.cast::<LateOutputReleaseContext>()) };
+    context.cleanup.release(env)?;
+    js_undefined(env)
+  })
+}
+
+unsafe extern "C" fn late_output_release_rejected(
+  env: sys::napi_env,
+  info: sys::napi_callback_info,
+) -> sys::napi_value {
+  let (_, data) = match callback_args_with_data(env, info, 1) {
+    Ok(value) => value,
+    Err(_) => return js_undefined(env).unwrap_or(ptr::null_mut()),
+  };
+  let context = unsafe { &*(data.cast::<LateOutputReleaseContext>()) };
+  let _ = context.cleanup.release(env);
+  js_undefined(env).unwrap_or(ptr::null_mut())
+}
+
+unsafe extern "C" fn finalize_late_output_release_context(
+  _env: sys::napi_env,
+  data: *mut c_void,
+  _hint: *mut c_void,
+) {
+  if !data.is_null() {
+    drop(unsafe { Box::from_raw(data.cast::<LateOutputReleaseContext>()) });
+  }
+}
+
+unsafe extern "C" fn finalize_async_result_context(
+  _env: sys::napi_env,
   data: *mut c_void,
   _hint: *mut c_void,
 ) {
   if !data.is_null() {
     let context = unsafe { Box::from_raw(data.cast::<AsyncResultContext>()) };
-    if !context.shared.settled.replace(true) && !context.shared.state.is_null() {
-      let state = unsafe { &*context.shared.state };
-      if let Some(snapshot) = context.shared.snapshot.borrow_mut().take() {
-        if !state.closed.get() {
-          state.rollback(snapshot);
+    if !context.shared.settled.replace(true) {
+      if let Some(state) = context.shared.state() {
+        if let Some(snapshot) = context.shared.snapshot.borrow_mut().take() {
+          if !state.closing.get() && !state.closed.get() {
+            state.rollback(snapshot);
+          }
         }
       }
-      state.finish_pending_work();
+      context.shared.finish();
     }
-    delete_reference(env, context.session_reference);
+    context.session_reference.delete();
   }
 }
 
 unsafe extern "C" fn finalize_input_settlement_context(
-  env: sys::napi_env,
+  _env: sys::napi_env,
   data: *mut c_void,
   _hint: *mut c_void,
 ) {
   if !data.is_null() {
     let context = unsafe { Box::from_raw(data.cast::<InputSettlementContext>()) };
-    if !context.shared.settled.replace(true) && !context.shared.state.is_null() {
-      let state = unsafe { &*context.shared.state };
-      if !state.closed.get() {
-        let _ = state.release_input_stream(context.stream_id);
+    if !context.shared.settled.replace(true) {
+      if let Some(state) = context.shared.state() {
+        if !state.closed.get() {
+          let _ = state.release_input_stream(context.stream_id);
+        }
       }
-      state.finish_pending_work();
+      context.shared.finish();
     }
-    delete_reference(env, context.session_reference);
+    context.session_reference.delete();
   }
 }
 
 unsafe extern "C" fn finalize_output_cancel_context(
-  env: sys::napi_env,
+  _env: sys::napi_env,
   data: *mut c_void,
   _hint: *mut c_void,
 ) {
   if !data.is_null() {
     let context = unsafe { Box::from_raw(data.cast::<OutputCancelContext>()) };
-    if !context.shared.settled.replace(true) && !context.shared.state.is_null() {
-      let state = unsafe { &*context.shared.state };
-      let _ = state.complete_output_cancel(context.resource_reference);
-      state.finish_pending_work();
+    if !context.shared.settled.replace(true) {
+      if let Some(state) = context.shared.state() {
+        let _ = state.complete_output_cancel(context.resource_reference);
+      }
+      context.shared.finish();
     }
-    delete_reference(env, context.session_reference);
+    context.session_reference.delete();
   }
 }
 
@@ -2987,6 +3976,36 @@ fn callback_args_with_data(
     return Err(Error::new(
       Status::GenericFailure,
       "missing settlement context",
+    ));
+  }
+  Ok((args, data))
+}
+
+fn callback_args_dynamic(
+  env: sys::napi_env,
+  info: sys::napi_callback_info,
+) -> Result<(Vec<sys::napi_value>, *mut c_void)> {
+  let mut argc = 0;
+  let mut this = ptr::null_mut();
+  let mut data = ptr::null_mut();
+  napi::check_status!(unsafe {
+    sys::napi_get_cb_info(env, info, &mut argc, ptr::null_mut(), &mut this, &mut data)
+  })?;
+  let mut args = vec![ptr::null_mut(); argc];
+  napi::check_status!(unsafe {
+    sys::napi_get_cb_info(
+      env,
+      info,
+      &mut argc,
+      args.as_mut_ptr(),
+      &mut this,
+      &mut data,
+    )
+  })?;
+  if data.is_null() {
+    return Err(Error::new(
+      Status::GenericFailure,
+      "missing Host proxy context",
     ));
   }
   Ok((args, data))

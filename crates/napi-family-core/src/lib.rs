@@ -17,6 +17,27 @@ pub enum HostFlavor {
   Ohos,
 }
 
+/// Action to take when a session close grace period expires.
+///
+/// The canonical plan currently defines only detach.  Keeping this as an
+/// engine-owned enum makes the policy mechanically carry the canonical action
+/// without exposing another runtime configuration surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeadlineAction {
+  Detach,
+}
+
+/// Immutable close policy projected by the UniFFI frontend.
+///
+/// There is deliberately no default or parser in the N-API family crate.  The
+/// frontend owns the single default and supplies this value as part of every
+/// [`FamilyPlanInput`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClosePolicy {
+  pub grace_ms: u32,
+  pub on_deadline: DeadlineAction,
+}
+
 impl HostFlavor {
   pub const fn hooks(self) -> HostHooks {
     match self {
@@ -305,6 +326,7 @@ pub struct FamilyOperationInput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FamilyPlanInput {
   pub flavor: HostFlavor,
+  pub close_policy: ClosePolicy,
   pub operations: Vec<FamilyOperationInput>,
 }
 
@@ -361,12 +383,14 @@ pub struct FamilyOperation {
 pub struct FamilyPlan {
   flavor: HostFlavor,
   hooks: HostHooks,
+  close_policy: ClosePolicy,
   operations: Vec<FamilyOperation>,
   runtime_entrypoints: BTreeSet<RuntimeEntrypoint>,
 }
 
 impl FamilyPlan {
   pub fn build(input: FamilyPlanInput) -> Result<Self, FamilyPlanError> {
+    validate_close_policy(input.close_policy)?;
     let mut operations = input.operations;
     let mut seen_ids = BTreeSet::new();
     for operation in &operations {
@@ -602,6 +626,7 @@ impl FamilyPlan {
     Ok(Self {
       flavor: input.flavor,
       hooks: input.flavor.hooks(),
+      close_policy: input.close_policy,
       operations: family_operations,
       runtime_entrypoints: entrypoints,
     })
@@ -615,6 +640,10 @@ impl FamilyPlan {
     self.hooks
   }
 
+  pub const fn close_policy(&self) -> ClosePolicy {
+    self.close_policy
+  }
+
   pub fn operations(&self) -> &[FamilyOperation] {
     &self.operations
   }
@@ -622,6 +651,22 @@ impl FamilyPlan {
   pub fn runtime_entrypoints(&self) -> impl Iterator<Item = RuntimeEntrypoint> + '_ {
     self.runtime_entrypoints.iter().copied()
   }
+}
+
+/// Node's timer API accepts a signed 32-bit millisecond delay.  Keep the
+/// policy in the exact range that can be represented without clamping or
+/// floating-point conversion surprises; the frontend remains responsible for
+/// choosing the value/default.
+fn validate_close_policy(policy: ClosePolicy) -> Result<(), FamilyPlanError> {
+  if policy.grace_ms > i32::MAX as u32 {
+    return Err(FamilyPlanError::ClosePolicyOutOfRange {
+      grace_ms: policy.grace_ms,
+    });
+  }
+  if !matches!(policy.on_deadline, DeadlineAction::Detach) {
+    return Err(FamilyPlanError::UnsupportedDeadlineAction);
+  }
+  Ok(())
 }
 
 fn validate_operation_shape(operation: &FamilyOperationInput) -> Result<(), FamilyPlanError> {
@@ -797,6 +842,10 @@ fn add_runtime_entrypoints(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FamilyPlanError {
+  ClosePolicyOutOfRange {
+    grace_ms: u32,
+  },
+  UnsupportedDeadlineAction,
   DuplicateOperationId {
     id: u32,
   },
@@ -891,6 +940,13 @@ pub enum FamilyPlanError {
 impl fmt::Display for FamilyPlanError {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
+      Self::ClosePolicyOutOfRange { grace_ms } => write!(
+        formatter,
+        "N-API close policy grace_ms {grace_ms} exceeds the JavaScript timer range"
+      ),
+      Self::UnsupportedDeadlineAction => {
+        formatter.write_str("N-API close policy uses an unsupported deadline action")
+      }
       Self::DuplicateOperationId { id } => write!(formatter, "duplicate N-API operation ID {id}"),
       Self::NonDenseOperationId { expected, actual } => {
         write!(
@@ -1078,6 +1134,11 @@ impl From<u64> for BigIntWords {
 mod tests {
   use super::*;
 
+  const TEST_CLOSE_POLICY: ClosePolicy = ClosePolicy {
+    grace_ms: 5_000,
+    on_deadline: DeadlineAction::Detach,
+  };
+
   fn operation(id: u32, kind: OperationKind, dispatch: OperationDispatch) -> FamilyOperationInput {
     FamilyOperationInput {
       id,
@@ -1123,9 +1184,28 @@ mod tests {
   }
 
   #[test]
+  fn close_policy_is_required_and_timer_safe() {
+    let operation = operation(0, OperationKind::Function, OperationDispatch::Native);
+    let mut plan_input = FamilyPlanInput {
+      flavor: HostFlavor::Node,
+      close_policy: TEST_CLOSE_POLICY,
+      operations: vec![operation.clone()],
+    };
+    let plan = FamilyPlan::build(plan_input.clone()).unwrap();
+    assert_eq!(plan.close_policy(), TEST_CLOSE_POLICY);
+
+    plan_input.close_policy.grace_ms = i32::MAX as u32 + 1;
+    assert!(matches!(
+      FamilyPlan::build(plan_input),
+      Err(FamilyPlanError::ClosePolicyOutOfRange { .. })
+    ));
+  }
+
+  #[test]
   fn family_validates_dense_ids_method_dispatch_and_lifetimes() {
     let plan = FamilyPlan::build(FamilyPlanInput {
       flavor: HostFlavor::Node,
+      close_policy: TEST_CLOSE_POLICY,
       operations: vec![
         operation(1, OperationKind::Function, OperationDispatch::Native),
         operation(0, OperationKind::Function, OperationDispatch::Native),
@@ -1139,6 +1219,7 @@ mod tests {
 
     let bad = FamilyPlan::build(FamilyPlanInput {
       flavor: HostFlavor::Node,
+      close_policy: TEST_CLOSE_POLICY,
       operations: vec![operation(
         0,
         OperationKind::CallbackMethod,
@@ -1156,6 +1237,7 @@ mod tests {
     misplaced_host.async_kind = AsyncKind::Async;
     let bad = FamilyPlan::build(FamilyPlanInput {
       flavor: HostFlavor::Node,
+      close_policy: TEST_CLOSE_POLICY,
       operations: vec![misplaced_host],
     })
     .unwrap_err();
@@ -1240,6 +1322,7 @@ mod tests {
     });
     let error = FamilyPlan::build(FamilyPlanInput {
       flavor: HostFlavor::Ohos,
+      close_policy: TEST_CLOSE_POLICY,
       operations: vec![op.clone(), pull.clone(), bad_cancel],
     })
     .unwrap_err();
@@ -1248,6 +1331,7 @@ mod tests {
     orphan_owner.streams.clear();
     let error = FamilyPlan::build(FamilyPlanInput {
       flavor: HostFlavor::Ohos,
+      close_policy: TEST_CLOSE_POLICY,
       operations: vec![orphan_owner, pull.clone(), cancel.clone()],
     })
     .unwrap_err();
@@ -1263,6 +1347,7 @@ mod tests {
     mismatched_slot.stream_slot.as_mut().unwrap().kind = OperationKind::InputStreamPull;
     let error = FamilyPlan::build(FamilyPlanInput {
       flavor: HostFlavor::Ohos,
+      close_policy: TEST_CLOSE_POLICY,
       operations: vec![op.clone(), pull.clone(), mismatched_slot],
     })
     .unwrap_err();
@@ -1276,6 +1361,7 @@ mod tests {
     ));
     let plan = FamilyPlan::build(FamilyPlanInput {
       flavor: HostFlavor::Ohos,
+      close_policy: TEST_CLOSE_POLICY,
       operations: vec![op, pull, cancel],
     })
     .unwrap();
@@ -1304,6 +1390,7 @@ mod tests {
     });
     let error = FamilyPlan::build(FamilyPlanInput {
       flavor: HostFlavor::Node,
+      close_policy: TEST_CLOSE_POLICY,
       operations: vec![op.clone()],
     })
     .unwrap_err();
@@ -1315,6 +1402,7 @@ mod tests {
     ]);
     let error = FamilyPlan::build(FamilyPlanInput {
       flavor: HostFlavor::Node,
+      close_policy: TEST_CLOSE_POLICY,
       operations: vec![op],
     })
     .unwrap_err();
@@ -1337,6 +1425,7 @@ mod tests {
     });
     FamilyPlan::build(FamilyPlanInput {
       flavor: HostFlavor::Node,
+      close_policy: TEST_CLOSE_POLICY,
       operations: vec![valid],
     })
     .unwrap();

@@ -25,6 +25,7 @@ use quote::{format_ident, quote};
 use syn::{Path, Type};
 
 pub use napi_family_core;
+pub use napi_family_core::{ClosePolicy, DeadlineAction};
 mod session;
 pub use session::{
   create_backend_session, take_session_callback_transfers, SessionCallbackArgument,
@@ -742,7 +743,13 @@ pub fn generate_napi_module(
   }
 
   let resource_callbacks = generate_resource_callbacks(rust.resource_hooks(), &mut source)?;
-  let factory = generate_factory(family.flavor(), family, &callbacks, &resource_callbacks)?;
+  let factory = generate_factory(
+    family.flavor(),
+    family.close_policy(),
+    family,
+    &callbacks,
+    &resource_callbacks,
+  )?;
   source.extend(factory.body);
   factory
     .function
@@ -796,12 +803,27 @@ fn generate_operation(
           | ArgumentBinding::LowerWithHost { .. }
       )
     });
+  // A Host proxy is a per-invocation JS object and is therefore not `Send`.
+  // For async HostAndArguments operations, lower the Host synchronously in the
+  // N-API entry point and only move the resulting native proxy/carriers into
+  // the worker future.  Keeping this special case in the engine frontend
+  // avoids teaching the generic backend about this engine-owned protocol.
+  let manual_async_host = requires_host && async_kind == AsyncKind::Async;
   let mut function_builder = NapiFnBuilder::new(function_name.clone(), function_name.to_string());
   if requires_host {
     function_builder = function_builder.argument(NapiFnArg {
       kind: NapiFnArgKind::PatType(Box::new(
         syn::parse_quote!(__uniffi_host: napi::bindgen_prelude::Object<'static>),
       )),
+      ts_arg_type: None,
+    });
+  }
+  if manual_async_host {
+    // `Env` is injected by the backend and is not a JavaScript argument.  It
+    // lets the synchronous entry create a Promise before its Host object is
+    // dropped, while no raw N-API value is captured by the worker future.
+    function_builder = function_builder.argument(NapiFnArg {
+      kind: NapiFnArgKind::PatType(Box::new(syn::parse_quote!(__uniffi_env: &napi::Env))),
       ts_arg_type: None,
     });
   }
@@ -813,9 +835,16 @@ fn generate_operation(
       });
     }
   }
+  function_builder = if manual_async_host {
+    function_builder
+      .result_return_type(syn::parse_quote!(napi::bindgen_prelude::sys::napi_value))
+      .asynchronous(false)
+  } else {
+    function_builder
+      .return_type(syn::parse_quote!(napi_uniffi_engine::NapiCallResult<#return_carrier>))
+      .asynchronous(async_kind == AsyncKind::Async)
+  };
   function_builder = function_builder
-    .return_type(syn::parse_quote!(napi_uniffi_engine::NapiCallResult<#return_carrier>))
-    .asynchronous(async_kind == AsyncKind::Async)
     .strict(true)
     .skip_typescript(true)
     .private(true)
@@ -823,6 +852,23 @@ fn generate_operation(
 
   let mut argument_names = Vec::with_capacity(operation.arguments.len());
   let mut lowerings = Vec::new();
+  let lower_error = |error: TokenStream| {
+    if manual_async_host {
+      quote! {
+        {
+          let __uniffi_error_promise = napi::bindgen_prelude::PromiseRaw::<
+            napi_uniffi_engine::NapiCallResult<#return_carrier>
+          >::resolve(
+            __uniffi_env,
+            napi_uniffi_engine::NapiCallResult::Error(#error),
+          )?;
+          return Ok(napi::bindgen_prelude::JsValue::raw(&__uniffi_error_promise));
+        }
+      }
+    } else {
+      quote! { { return napi_uniffi_engine::NapiCallResult::Error(#error); } }
+    }
+  };
   if let Some(receiver) = &operation.receiver {
     let name = &receiver.name;
     let carrier_type = receiver.binding.carrier_type();
@@ -841,10 +887,11 @@ fn generate_operation(
         });
       }
     };
+    let error = lower_error(quote!(error));
     lowerings.push(quote! {
       let #name = match #lower(#name) {
         Ok(value) => value,
-        Err(error) => return napi_uniffi_engine::NapiCallResult::Error(error),
+        Err(error) => #error
       };
     });
   }
@@ -859,19 +906,26 @@ fn generate_operation(
     argument_names.push(name.clone());
     match &argument.binding {
       ArgumentBinding::Direct { .. } => {}
-      ArgumentBinding::I64BigInt => lowerings.push(quote! {
+      ArgumentBinding::I64BigInt => {
+        let error = lower_error(quote!(
+          napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string())
+        ));
+        lowerings.push(quote! {
         let (__uniffi_value, __uniffi_lossless) = #name.get_i64();
         let #name = match napi_uniffi_engine::napi_family_core::require_lossless_i64(
           __uniffi_value,
           __uniffi_lossless,
         ) {
           Ok(value) => value,
-          Err(error) => return napi_uniffi_engine::NapiCallResult::Error(
-            napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()),
-          ),
+          Err(error) => #error,
         };
-      }),
-      ArgumentBinding::U64BigInt => lowerings.push(quote! {
+        });
+      }
+      ArgumentBinding::U64BigInt => {
+        let error = lower_error(quote!(
+          napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string())
+        ));
+        lowerings.push(quote! {
         let (__uniffi_negative, __uniffi_value, __uniffi_lossless) = #name.get_u64();
         let #name = match napi_uniffi_engine::napi_family_core::require_lossless_u64(
           __uniffi_negative,
@@ -879,25 +933,30 @@ fn generate_operation(
           __uniffi_lossless,
         ) {
           Ok(value) => value,
-          Err(error) => return napi_uniffi_engine::NapiCallResult::Error(
-            napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()),
-          ),
+          Err(error) => #error,
         };
-      }),
+        });
+      }
       ArgumentBinding::LowerWith { lower, .. }
       | ArgumentBinding::ObjectLease { lower, .. }
-      | ArgumentBinding::OutputStreamLease { lower, .. } => lowerings.push(quote! {
+      | ArgumentBinding::OutputStreamLease { lower, .. } => {
+        let error = lower_error(quote!(error));
+        lowerings.push(quote! {
         let #name = match #lower(#name) {
           Ok(value) => value,
-          Err(error) => return napi_uniffi_engine::NapiCallResult::Error(error),
+          Err(error) => #error,
         };
-      }),
-      ArgumentBinding::LowerWithHost { lower, .. } => lowerings.push(quote! {
+        });
+      }
+      ArgumentBinding::LowerWithHost { lower, .. } => {
+        let error = lower_error(quote!(error));
+        lowerings.push(quote! {
         let #name = match #lower(&__uniffi_host, #name, &__uniffi_callback_transfers) {
           Ok(value) => value,
-          Err(error) => return napi_uniffi_engine::NapiCallResult::Error(error),
+          Err(error) => #error,
         };
-      }),
+        });
+      }
       ArgumentBinding::CallbackProxy { build, .. } => {
         let callback = family
           .callbacks
@@ -920,15 +979,17 @@ fn generate_operation(
           .iter()
           .position(|candidate| std::ptr::eq(candidate, callback))
           .expect("callback use-site belongs to family operation");
+        let lease_error = lower_error(quote!(
+          napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string())
+        ));
+        let build_error = lower_error(quote!(error));
         lowerings.push(quote! {
           let __uniffi_callback_lease = match __uniffi_callback_transfers.lease(
             #callback_index,
             0,
           ) {
             Ok(value) => value,
-            Err(error) => return napi_uniffi_engine::NapiCallResult::Error(
-              napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()),
-            ),
+            Err(error) => #lease_error,
           };
           let #name = match #build(
             &__uniffi_host,
@@ -938,7 +999,7 @@ fn generate_operation(
             __uniffi_callback_lease,
           ) {
             Ok(value) => value,
-            Err(error) => return napi_uniffi_engine::NapiCallResult::Error(error),
+            Err(error) => #build_error,
           };
         });
       }
@@ -957,10 +1018,11 @@ fn generate_operation(
             role: "input stream",
           });
         }
+        let error = lower_error(quote!(error));
         lowerings.push(quote! {
           let #name = match #build(&__uniffi_host, #name) {
             Ok(value) => value,
-            Err(error) => return napi_uniffi_engine::NapiCallResult::Error(error),
+            Err(error) => #error,
           };
         });
       }
@@ -986,6 +1048,15 @@ fn generate_operation(
       };
     },
   };
+  let value_manual = match &operation.error_binding {
+    ErrorBinding::Infallible => quote!(let __uniffi_value = #invoke;),
+    ErrorBinding::Descriptor { map } => quote! {
+      let __uniffi_value = match #invoke {
+        Ok(value) => value,
+        Err(error) => return Ok(napi_uniffi_engine::NapiCallResult::Error(#map(error))),
+      };
+    },
+  };
   let lift = match &operation.return_binding {
     ReturnBinding::Unit | ReturnBinding::Direct { .. } => quote!(__uniffi_value),
     ReturnBinding::I64BigInt | ReturnBinding::U64BigInt => quote!({
@@ -1002,6 +1073,25 @@ fn generate_operation(
       match #lift(__uniffi_value) {
         Ok(value) => value,
         Err(error) => return napi_uniffi_engine::NapiCallResult::Error(error),
+      }
+    }),
+  };
+  let lift_manual = match &operation.return_binding {
+    ReturnBinding::Unit | ReturnBinding::Direct { .. } => quote!(__uniffi_value),
+    ReturnBinding::I64BigInt | ReturnBinding::U64BigInt => quote!({
+      let parts = napi_uniffi_engine::napi_family_core::BigIntWords::from(__uniffi_value);
+      napi::bindgen_prelude::BigInt {
+        sign_bit: parts.negative,
+        words: parts.words,
+      }
+    }),
+    ReturnBinding::LiftWith { lift, .. }
+    | ReturnBinding::ObjectLease { lift, .. }
+    | ReturnBinding::CallbackLease { lift, .. }
+    | ReturnBinding::OutputStreamLease { lift, .. } => quote!({
+      match #lift(__uniffi_value) {
+        Ok(value) => value,
+        Err(error) => return Ok(napi_uniffi_engine::NapiCallResult::Error(error)),
       }
     }),
   };
@@ -1028,17 +1118,25 @@ fn generate_operation(
       __uniffi_callback_transfer: u32,
     }
   });
-  let keep_host_alive = requires_host.then(|| quote!(let _ = &__uniffi_host;));
+  // Synchronous operations keep the Host borrow marker to satisfy Rust's
+  // unused-parameter checks.  Async Host operations use the dedicated entry
+  // above, so no raw Host value is present in their worker future.
+  let keep_host_alive = if requires_host && async_kind == AsyncKind::Sync {
+    quote!(let _ = &__uniffi_host;)
+  } else {
+    quote!()
+  };
   let callback_transfers = if callback_transfer {
+    let error = lower_error(quote!(
+      napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string())
+    ));
     quote! {
       let __uniffi_callback_transfers = match napi_uniffi_engine::take_session_callback_transfers(
         __uniffi_session_generation,
         __uniffi_callback_transfer,
       ) {
         Ok(value) => value,
-        Err(error) => return napi_uniffi_engine::NapiCallResult::Error(
-          napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()),
-        ),
+        Err(error) => #error,
       };
     }
   } else {
@@ -1048,19 +1146,44 @@ fn generate_operation(
     }
   };
   let return_carrier = operation.return_binding.carrier_type();
-  let body = quote! {
-    #[doc(hidden)]
-    #async_token fn #function_name(
-      #host_declaration
-      #transfer_declaration
-      #(#receiver_declaration)*
-      #(#argument_declarations),*
-    ) -> napi_uniffi_engine::NapiCallResult<#return_carrier> {
-      #keep_host_alive
-      #callback_transfers
-      #(#lowerings)*
-      #value
-      napi_uniffi_engine::NapiCallResult::Value(#lift)
+  let env_declaration = manual_async_host.then(|| quote!(__uniffi_env: &napi::Env,));
+  let body = if manual_async_host {
+    quote! {
+      #[doc(hidden)]
+      fn #function_name(
+        #host_declaration
+        #env_declaration
+        #transfer_declaration
+        #(#receiver_declaration)*
+        #(#argument_declarations),*
+      ) -> napi::Result<napi::bindgen_prelude::sys::napi_value> {
+        #callback_transfers
+        #(#lowerings)*
+        let __uniffi_future = async move {
+          #value_manual
+          Ok::<napi_uniffi_engine::NapiCallResult<#return_carrier>, napi::Error>(
+            napi_uniffi_engine::NapiCallResult::Value(#lift_manual)
+          )
+        };
+        let __uniffi_promise = __uniffi_env.spawn_future(__uniffi_future)?;
+        Ok(napi::bindgen_prelude::JsValue::raw(&__uniffi_promise))
+      }
+    }
+  } else {
+    quote! {
+      #[doc(hidden)]
+      #async_token fn #function_name(
+        #host_declaration
+        #transfer_declaration
+        #(#receiver_declaration)*
+        #(#argument_declarations),*
+      ) -> napi_uniffi_engine::NapiCallResult<#return_carrier> {
+        #keep_host_alive
+        #callback_transfers
+        #(#lowerings)*
+        #value
+        napi_uniffi_engine::NapiCallResult::Value(#lift)
+      }
     }
   };
 
@@ -1189,6 +1312,7 @@ fn generate_resource_callback(
 
 fn generate_factory(
   flavor: HostFlavor,
+  close_policy: ClosePolicy,
   family: &FamilyPlan,
   callbacks: &[Option<Ident>],
   resource_callbacks: &GeneratedResourceCallbacks,
@@ -1215,6 +1339,10 @@ fn generate_factory(
     HostFlavor::Node => "node",
     HostFlavor::Ohos => "ohos",
   };
+  let grace_ms = close_policy.grace_ms;
+  let on_deadline = match close_policy.on_deadline {
+    DeadlineAction::Detach => quote!(napi_uniffi_engine::DeadlineAction::Detach),
+  };
   let descriptors = family
     .operations()
     .iter()
@@ -1236,6 +1364,10 @@ fn generate_factory(
         env,
         host,
         #flavor,
+        napi_uniffi_engine::ClosePolicy {
+          grace_ms: #grace_ms,
+          on_deadline: #on_deadline,
+        },
         vec![#(#descriptors),*],
         napi_uniffi_engine::SessionResourceCallbacks {
           release_object: #release_object,

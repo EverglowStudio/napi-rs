@@ -1,9 +1,9 @@
 use napi_family_core::{
   AsyncKind, CallbackContract, CallbackReentrancy, CallbackRetention, CallbackThreading,
-  CallbackUseSite, CarrierKind, ConversionRecipe, FamilyOperationInput, FamilyOperationTarget,
-  FamilyPlan, FamilyPlanInput, HostFlavor, OperationDispatch, OperationKind, ResourceBinding,
-  ResourceKind, ResourceOwnership, StreamDirection, StreamSlotIdentity, StreamUseSite,
-  StreamValueBinding, ValuePath,
+  CallbackUseSite, CarrierKind, ClosePolicy, ConversionRecipe, DeadlineAction,
+  FamilyOperationInput, FamilyOperationTarget, FamilyPlan, FamilyPlanInput, HostFlavor,
+  OperationDispatch, OperationKind, ResourceBinding, ResourceKind, ResourceOwnership,
+  StreamDirection, StreamSlotIdentity, StreamUseSite, StreamValueBinding, ValuePath,
 };
 use napi_uniffi_engine::{
   generate_napi_module, ArgumentBinding, ErrorBinding, ReturnBinding, RustArgumentPlan,
@@ -15,6 +15,11 @@ use proc_macro2::{Ident, Span};
 fn ident(name: &str) -> Ident {
   Ident::new(name, Span::call_site())
 }
+
+const TEST_CLOSE_POLICY: ClosePolicy = ClosePolicy {
+  grace_ms: 5_000,
+  on_deadline: DeadlineAction::Detach,
+};
 
 fn argument(name: &str, binding: ArgumentBinding) -> RustArgumentPlan {
   RustArgumentPlan {
@@ -259,7 +264,12 @@ fn family(flavor: HostFlavor) -> FamilyPlan {
     operation_id: 10,
     kind: OperationKind::InputStreamCancel,
   });
-  FamilyPlan::build(FamilyPlanInput { flavor, operations }).unwrap()
+  FamilyPlan::build(FamilyPlanInput {
+    flavor,
+    close_policy: TEST_CLOSE_POLICY,
+    operations,
+  })
+  .unwrap()
 }
 
 fn native(
@@ -594,6 +604,7 @@ fn structured_bindings_match_every_canonical_use_site() {
   };
   let nested_family = FamilyPlan::build(FamilyPlanInput {
     flavor: HostFlavor::Node,
+    close_policy: TEST_CLOSE_POLICY,
     operations: vec![nested_operation],
   })
   .unwrap();
@@ -628,6 +639,7 @@ fn structured_bindings_match_every_canonical_use_site() {
 
   let no_use_family = FamilyPlan::build(FamilyPlanInput {
     flavor: HostFlavor::Node,
+    close_policy: TEST_CLOSE_POLICY,
     operations: vec![family_operation(
       0,
       OperationKind::Function,
@@ -676,6 +688,7 @@ fn structured_bindings_match_every_canonical_use_site() {
   });
   let return_callback_family = FamilyPlan::build(FamilyPlanInput {
     flavor: HostFlavor::Node,
+    close_policy: TEST_CLOSE_POLICY,
     operations: vec![return_callback_operation],
   })
   .unwrap();
@@ -704,6 +717,7 @@ fn structured_bindings_match_every_canonical_use_site() {
 
   let no_return_callback_family = FamilyPlan::build(FamilyPlanInput {
     flavor: HostFlavor::Node,
+    close_policy: TEST_CLOSE_POLICY,
     operations: vec![family_operation(
       0,
       OperationKind::Function,
@@ -730,6 +744,7 @@ fn structured_bindings_match_every_canonical_use_site() {
 
   let host_family = FamilyPlan::build(FamilyPlanInput {
     flavor: HostFlavor::Node,
+    close_policy: TEST_CLOSE_POLICY,
     operations: vec![FamilyOperationInput {
       id: 0,
       kind: OperationKind::CallbackMethod,
@@ -779,6 +794,7 @@ fn resource_results_are_mechanically_bound_to_return_carriers() {
 
   let no_resource_family = FamilyPlan::build(FamilyPlanInput {
     flavor: HostFlavor::Node,
+    close_policy: TEST_CLOSE_POLICY,
     operations: vec![family_operation(
       0,
       OperationKind::Function,
