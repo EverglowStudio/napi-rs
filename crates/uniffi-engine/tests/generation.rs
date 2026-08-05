@@ -1,8 +1,9 @@
 use napi_family_core::{
   AsyncKind, CallbackContract, CallbackReentrancy, CallbackRetention, CallbackThreading,
-  CallbackUseSite, FamilyOperationInput, FamilyOperationTarget, FamilyPlan, FamilyPlanInput,
-  HostFlavor, OperationDispatch, OperationKind, ResourceBinding, ResourceKind, ResourceOwnership,
-  StreamDirection, StreamUseSite, ValuePath,
+  CallbackUseSite, CarrierKind, ConversionRecipe, FamilyOperationInput, FamilyOperationTarget,
+  FamilyPlan, FamilyPlanInput, HostFlavor, OperationDispatch, OperationKind, ResourceBinding,
+  ResourceKind, ResourceOwnership, StreamDirection, StreamSlotIdentity, StreamUseSite,
+  StreamValueBinding, ValuePath,
 };
 use napi_uniffi_engine::{
   generate_napi_module, ArgumentBinding, ErrorBinding, ReturnBinding, RustArgumentPlan,
@@ -41,6 +42,7 @@ fn family_operation(
     result: None,
     callbacks: Vec::new(),
     streams: Vec::new(),
+    stream_slot: None,
   }
 }
 
@@ -162,8 +164,40 @@ fn family(flavor: HostFlavor) -> FamilyPlan {
   });
   operations[5].streams.push(StreamUseSite {
     operation_id: 5,
+    use_site_id: 0,
     path: ValuePath::return_value(),
     direction: StreamDirection::Output,
+    item: StreamValueBinding {
+      carrier: CarrierKind::Primitive,
+      conversion: ConversionRecipe::Identity,
+    },
+    error: StreamValueBinding {
+      carrier: CarrierKind::Primitive,
+      conversion: ConversionRecipe::Identity,
+    },
+    is_send: false,
+    slots: vec![
+      StreamSlotIdentity {
+        use_site_id: 0,
+        operation_id: 5,
+        kind: OperationKind::OutputStreamStart,
+      },
+      StreamSlotIdentity {
+        use_site_id: 0,
+        operation_id: 6,
+        kind: OperationKind::OutputStreamNext,
+      },
+      StreamSlotIdentity {
+        use_site_id: 0,
+        operation_id: 7,
+        kind: OperationKind::OutputStreamCancel,
+      },
+    ],
+  });
+  operations[5].stream_slot = Some(StreamSlotIdentity {
+    use_site_id: 0,
+    operation_id: 5,
+    kind: OperationKind::OutputStreamStart,
   });
   for (id, kind) in [
     (6, OperationKind::OutputStreamNext),
@@ -174,11 +208,56 @@ fn family(flavor: HostFlavor) -> FamilyPlan {
       ownership: ResourceOwnership::Borrowed,
     });
     operations[id as usize].kind = kind;
+    operations[id as usize].stream_slot = Some(StreamSlotIdentity {
+      use_site_id: 0,
+      operation_id: id,
+      kind,
+    });
   }
   operations[8].streams.push(StreamUseSite {
     operation_id: 8,
+    use_site_id: 1,
     path: ValuePath::argument(0),
     direction: StreamDirection::Input,
+    item: StreamValueBinding {
+      carrier: CarrierKind::Primitive,
+      conversion: ConversionRecipe::Identity,
+    },
+    error: StreamValueBinding {
+      carrier: CarrierKind::Primitive,
+      conversion: ConversionRecipe::Identity,
+    },
+    is_send: false,
+    slots: vec![
+      StreamSlotIdentity {
+        use_site_id: 1,
+        operation_id: 9,
+        kind: OperationKind::InputStreamPull,
+      },
+      StreamSlotIdentity {
+        use_site_id: 1,
+        operation_id: 10,
+        kind: OperationKind::InputStreamCancel,
+      },
+    ],
+  });
+  operations[9].receiver = Some(ResourceBinding {
+    kind: ResourceKind::InputStream,
+    ownership: ResourceOwnership::Borrowed,
+  });
+  operations[10].receiver = Some(ResourceBinding {
+    kind: ResourceKind::InputStream,
+    ownership: ResourceOwnership::Borrowed,
+  });
+  operations[9].stream_slot = Some(StreamSlotIdentity {
+    use_site_id: 1,
+    operation_id: 9,
+    kind: OperationKind::InputStreamPull,
+  });
+  operations[10].stream_slot = Some(StreamSlotIdentity {
+    use_site_id: 1,
+    operation_id: 10,
+    kind: OperationKind::InputStreamCancel,
   });
   FamilyPlan::build(FamilyPlanInput { flavor, operations }).unwrap()
 }
@@ -484,6 +563,208 @@ fn callback_and_stream_bindings_are_structured() {
   };
   let error = RustBridgePlan::build(&family, operations).unwrap_err();
   assert!(error.to_string().contains("structured callback"));
+}
+
+#[test]
+fn structured_bindings_match_every_canonical_use_site() {
+  let nested_operation = FamilyOperationInput {
+    id: 0,
+    kind: OperationKind::Function,
+    async_kind: AsyncKind::Sync,
+    fallible: false,
+    argument_count: 1,
+    dispatch: OperationDispatch::Native,
+    receiver: None,
+    result: None,
+    callbacks: vec![CallbackUseSite {
+      operation_id: 0,
+      callback_type_id: 3,
+      path: ValuePath::new(vec![
+        napi_family_core::ValuePathSegment::Argument(0),
+        napi_family_core::ValuePathSegment::Field("callback".to_owned()),
+      ]),
+      contract: CallbackContract {
+        retention: CallbackRetention::Retained,
+        threading: CallbackThreading::CallingThread,
+        reentrancy: CallbackReentrancy::Allowed,
+      },
+    }],
+    streams: Vec::new(),
+    stream_slot: None,
+  };
+  let nested_family = FamilyPlan::build(FamilyPlanInput {
+    flavor: HostFlavor::Node,
+    operations: vec![nested_operation],
+  })
+  .unwrap();
+  let direct_binding = native(
+    0,
+    syn::parse_quote!(fixture::lower),
+    vec![argument(
+      "value",
+      ArgumentBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+    )],
+    ReturnBinding::Unit,
+    ErrorBinding::Infallible,
+  );
+  let error = RustBridgePlan::build(&nested_family, vec![direct_binding]).unwrap_err();
+  assert!(error.to_string().contains("structured callback"));
+  let nested_binding = native(
+    0,
+    syn::parse_quote!(fixture::lower),
+    vec![argument(
+      "value",
+      ArgumentBinding::LowerWithHost {
+        carrier_type: syn::parse_quote!(u32),
+        lower: syn::parse_quote!(fixture::lower),
+      },
+    )],
+    ReturnBinding::Unit,
+    ErrorBinding::Infallible,
+  );
+  assert!(RustBridgePlan::build(&nested_family, vec![nested_binding]).is_ok());
+
+  let no_use_family = FamilyPlan::build(FamilyPlanInput {
+    flavor: HostFlavor::Node,
+    operations: vec![family_operation(
+      0,
+      OperationKind::Function,
+      AsyncKind::Sync,
+      1,
+      false,
+      OperationDispatch::Native,
+    )],
+  })
+  .unwrap();
+  let missing_use_site = native(
+    0,
+    syn::parse_quote!(fixture::lower),
+    vec![argument(
+      "value",
+      ArgumentBinding::LowerWithHost {
+        carrier_type: syn::parse_quote!(u32),
+        lower: syn::parse_quote!(fixture::lower),
+      },
+    )],
+    ReturnBinding::Unit,
+    ErrorBinding::Infallible,
+  );
+  let error = RustBridgePlan::build(&no_use_family, vec![missing_use_site]).unwrap_err();
+  assert!(error
+    .to_string()
+    .contains("structured callback or input stream"));
+
+  let mut return_callback_operation = family_operation(
+    0,
+    OperationKind::Function,
+    AsyncKind::Sync,
+    0,
+    false,
+    OperationDispatch::Native,
+  );
+  return_callback_operation.callbacks.push(CallbackUseSite {
+    operation_id: 0,
+    callback_type_id: 3,
+    path: ValuePath::return_value(),
+    contract: CallbackContract {
+      retention: CallbackRetention::Retained,
+      threading: CallbackThreading::CallingThread,
+      reentrancy: CallbackReentrancy::Allowed,
+    },
+  });
+  let return_callback_family = FamilyPlan::build(FamilyPlanInput {
+    flavor: HostFlavor::Node,
+    operations: vec![return_callback_operation],
+  })
+  .unwrap();
+  let direct_return = native(
+    0,
+    syn::parse_quote!(fixture::return_callback),
+    Vec::new(),
+    ReturnBinding::Direct {
+      carrier_type: syn::parse_quote!(u32),
+    },
+    ErrorBinding::Infallible,
+  );
+  let error = RustBridgePlan::build(&return_callback_family, vec![direct_return]).unwrap_err();
+  assert!(error.to_string().contains("direct callback lease"));
+  let callback_lease = native(
+    0,
+    syn::parse_quote!(fixture::return_callback),
+    Vec::new(),
+    ReturnBinding::CallbackLease {
+      carrier_type: syn::parse_quote!(u32),
+      lift: syn::parse_quote!(fixture::lift_callback),
+    },
+    ErrorBinding::Infallible,
+  );
+  assert!(RustBridgePlan::build(&return_callback_family, vec![callback_lease]).is_ok());
+
+  let no_return_callback_family = FamilyPlan::build(FamilyPlanInput {
+    flavor: HostFlavor::Node,
+    operations: vec![family_operation(
+      0,
+      OperationKind::Function,
+      AsyncKind::Sync,
+      0,
+      false,
+      OperationDispatch::Native,
+    )],
+  })
+  .unwrap();
+  let stray_callback_lease = native(
+    0,
+    syn::parse_quote!(fixture::return_callback),
+    Vec::new(),
+    ReturnBinding::CallbackLease {
+      carrier_type: syn::parse_quote!(u32),
+      lift: syn::parse_quote!(fixture::lift_callback),
+    },
+    ErrorBinding::Infallible,
+  );
+  let error =
+    RustBridgePlan::build(&no_return_callback_family, vec![stray_callback_lease]).unwrap_err();
+  assert!(error.to_string().contains("direct callback lease"));
+
+  let host_family = FamilyPlan::build(FamilyPlanInput {
+    flavor: HostFlavor::Node,
+    operations: vec![FamilyOperationInput {
+      id: 0,
+      kind: OperationKind::CallbackMethod,
+      async_kind: AsyncKind::Sync,
+      fallible: false,
+      argument_count: 0,
+      dispatch: OperationDispatch::CallbackHost {
+        callback_type_id: 3,
+        method_id: 0,
+      },
+      receiver: None,
+      result: None,
+      callbacks: vec![CallbackUseSite {
+        operation_id: 0,
+        callback_type_id: 3,
+        path: ValuePath::return_value(),
+        contract: CallbackContract {
+          retention: CallbackRetention::Retained,
+          threading: CallbackThreading::CallingThread,
+          reentrancy: CallbackReentrancy::Allowed,
+        },
+      }],
+      streams: Vec::new(),
+      stream_slot: None,
+    }],
+  })
+  .unwrap();
+  let error = RustBridgePlan::build(
+    &host_family,
+    vec![host(0, RustOperationTarget::CallbackHost)],
+  )
+  .unwrap_err();
+  assert!(error
+    .to_string()
+    .contains("host operation 0 must not contain callback or stream use-sites"));
 }
 
 #[test]

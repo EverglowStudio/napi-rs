@@ -76,7 +76,7 @@ pub enum AsyncKind {
 }
 
 /// Mechanical operation shape.  This is not a public naming or type model.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum OperationKind {
   Function,
   Constructor,
@@ -101,6 +101,7 @@ pub enum ResourceOwnership {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResourceKind {
   Object,
+  InputStream,
   OutputStream,
 }
 
@@ -135,6 +136,48 @@ pub enum ValuePathSegment {
   MapKey,
   MapValue,
   SetElement,
+}
+
+/// A mechanical carrier class projected by the UniFFI engine adapter.  It is
+/// deliberately smaller than the public type graph: engines only need to
+/// know which local ABI carrier and conversion recipe to use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CarrierKind {
+  Primitive,
+  BigInt,
+  Bytes,
+  Timestamp,
+  Duration,
+  LocalAdapter,
+  OpaqueHandle,
+  CallbackProxy,
+  InputStream,
+  OutputStream,
+  StreamStep,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConversionRecipe {
+  Identity,
+  Optional(Box<Self>),
+  Sequence(Box<Self>),
+  Map(Box<Self>, Box<Self>),
+  Set(Box<Self>),
+  Record(u32),
+  Enum(u32),
+  Error(u32),
+  Object(u32),
+  Custom(u32, Box<Self>),
+  Callback(u32),
+  InputStream(Box<Self>),
+  OutputStream(Box<Self>),
+  StreamStep { item: Box<Self>, error: Box<Self> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamValueBinding {
+  pub carrier: CarrierKind,
+  pub conversion: ConversionRecipe,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -226,8 +269,20 @@ pub enum StreamDirection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamUseSite {
   pub operation_id: u32,
+  pub use_site_id: u32,
   pub path: ValuePath,
   pub direction: StreamDirection,
+  pub item: StreamValueBinding,
+  pub error: StreamValueBinding,
+  pub is_send: bool,
+  pub slots: Vec<StreamSlotIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamSlotIdentity {
+  pub use_site_id: u32,
+  pub operation_id: u32,
+  pub kind: OperationKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -242,6 +297,9 @@ pub struct FamilyOperationInput {
   pub result: Option<ResourceBinding>,
   pub callbacks: Vec<CallbackUseSite>,
   pub streams: Vec<StreamUseSite>,
+  /// Synthetic stream slots carry their canonical use-site/slot identity so
+  /// the family backend never derives a slot from an operation name.
+  pub stream_slot: Option<StreamSlotIdentity>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -295,6 +353,7 @@ pub struct FamilyOperation {
   pub result: Option<ResourceBinding>,
   pub callbacks: Vec<CallbackUseSite>,
   pub streams: Vec<StreamUseSite>,
+  pub stream_slot: Option<StreamSlotIdentity>,
   pub target: FamilyOperationTarget,
 }
 
@@ -316,6 +375,13 @@ impl FamilyPlan {
       }
     }
     operations.sort_by_key(|operation| operation.id);
+    let operation_ids = operations
+      .iter()
+      .map(|operation| operation.id)
+      .collect::<BTreeSet<_>>();
+    let mut stream_use_site_ids = BTreeSet::new();
+    let mut declared_stream_slots = BTreeSet::new();
+    let mut referenced_stream_slots = BTreeSet::new();
     for (expected, operation) in operations.iter().enumerate() {
       let expected = u32::try_from(expected).map_err(|_| FamilyPlanError::TooManyOperations)?;
       if operation.id != expected {
@@ -325,6 +391,37 @@ impl FamilyPlan {
         });
       }
       validate_operation_shape(operation)?;
+      if let Some(slot) = &operation.stream_slot {
+        if slot.operation_id != operation.id {
+          return Err(FamilyPlanError::StreamSlotOperationMismatch {
+            expected: operation.id,
+            actual: slot.operation_id,
+          });
+        }
+        if slot.kind != operation.kind {
+          return Err(FamilyPlanError::StreamSlotKindMismatch {
+            operation_id: operation.id,
+            expected: operation.kind,
+            actual: slot.kind,
+          });
+        }
+        if !matches!(
+          slot.kind,
+          OperationKind::InputStreamPull
+            | OperationKind::InputStreamCancel
+            | OperationKind::OutputStreamStart
+            | OperationKind::OutputStreamNext
+            | OperationKind::OutputStreamCancel
+        ) {
+          return Err(FamilyPlanError::InvalidStreamSlot { id: operation.id });
+        }
+        if !declared_stream_slots.insert((slot.use_site_id, slot.operation_id, slot.kind)) {
+          return Err(FamilyPlanError::DuplicateStreamSlot {
+            use_site_id: slot.use_site_id,
+            kind: slot.kind,
+          });
+        }
+      }
       for callback in &operation.callbacks {
         if callback.operation_id != operation.id {
           return Err(FamilyPlanError::UseSiteOperationMismatch {
@@ -344,7 +441,126 @@ impl FamilyPlan {
           });
         }
         validate_path(operation, &stream.path, "stream")?;
+        if !stream_use_site_ids.insert(stream.use_site_id) {
+          return Err(FamilyPlanError::DuplicateStreamUseSite {
+            use_site_id: stream.use_site_id,
+          });
+        }
+        let expected_kinds = match stream.direction {
+          StreamDirection::Input => vec![
+            OperationKind::InputStreamPull,
+            OperationKind::InputStreamCancel,
+          ],
+          StreamDirection::Output => vec![
+            OperationKind::OutputStreamStart,
+            OperationKind::OutputStreamNext,
+            OperationKind::OutputStreamCancel,
+          ],
+        };
+        if stream.slots.len() != expected_kinds.len()
+          || expected_kinds.iter().any(|kind| {
+            stream
+              .slots
+              .iter()
+              .filter(|slot| slot.kind == *kind)
+              .count()
+              != 1
+          })
+        {
+          return Err(FamilyPlanError::InvalidStreamSlot { id: operation.id });
+        }
+        for slot in &stream.slots {
+          if slot.use_site_id != stream.use_site_id {
+            return Err(FamilyPlanError::StreamSlotUseSiteMismatch {
+              expected: stream.use_site_id,
+              actual: slot.use_site_id,
+            });
+          }
+          if !operation_ids.contains(&slot.operation_id) {
+            return Err(FamilyPlanError::UnknownStreamSlotOperation {
+              use_site_id: stream.use_site_id,
+              operation_id: slot.operation_id,
+            });
+          }
+          if !referenced_stream_slots.insert((slot.use_site_id, slot.operation_id, slot.kind)) {
+            return Err(FamilyPlanError::DuplicateStreamSlot {
+              use_site_id: slot.use_site_id,
+              kind: slot.kind,
+            });
+          }
+          let Some(slot_operation) = operations
+            .iter()
+            .find(|candidate| candidate.id == slot.operation_id)
+          else {
+            unreachable!("operation ID was checked above")
+          };
+          if slot_operation.kind != slot.kind {
+            return Err(FamilyPlanError::StreamSlotKindMismatch {
+              operation_id: slot.operation_id,
+              expected: slot_operation.kind,
+              actual: slot.kind,
+            });
+          }
+          if let Some(declared_slot) = slot_operation.stream_slot.as_ref() {
+            if declared_slot.kind != slot.kind {
+              return Err(FamilyPlanError::StreamSlotKindMismatch {
+                operation_id: slot.operation_id,
+                expected: slot_operation.kind,
+                actual: declared_slot.kind,
+              });
+            }
+          }
+          if slot_operation.stream_slot.as_ref() != Some(slot) {
+            return Err(FamilyPlanError::StreamSlotIdentityMismatch {
+              use_site_id: stream.use_site_id,
+              operation_id: slot.operation_id,
+            });
+          }
+          if stream.direction == StreamDirection::Output
+            && slot.kind == OperationKind::OutputStreamStart
+            && slot.operation_id != operation.id
+          {
+            return Err(FamilyPlanError::InvalidStreamSlot { id: operation.id });
+          }
+          let direction_ok = match stream.direction {
+            StreamDirection::Input => {
+              matches!(
+                slot.kind,
+                OperationKind::InputStreamPull | OperationKind::InputStreamCancel
+              )
+            }
+            StreamDirection::Output => matches!(
+              slot.kind,
+              OperationKind::OutputStreamStart
+                | OperationKind::OutputStreamNext
+                | OperationKind::OutputStreamCancel
+            ),
+          };
+          if !direction_ok {
+            return Err(FamilyPlanError::InvalidStreamSlot { id: operation.id });
+          }
+        }
       }
+    }
+    let mut stream_ids = stream_use_site_ids.iter().copied().collect::<Vec<_>>();
+    stream_ids.sort_unstable();
+    if stream_ids
+      .iter()
+      .enumerate()
+      .any(|(expected, actual)| *actual != expected as u32)
+    {
+      return Err(FamilyPlanError::NonDenseStreamUseSiteId);
+    }
+    if let Some((use_site_id, operation_id, kind)) = declared_stream_slots
+      .difference(&referenced_stream_slots)
+      .next()
+      .copied()
+    {
+      return Err(FamilyPlanError::OrphanStreamSlot {
+        use_site_id,
+        operation_id,
+        kind,
+      });
     }
 
     let mut entrypoints = BTreeSet::from([RuntimeEntrypoint::CloseSession]);
@@ -377,6 +593,7 @@ impl FamilyPlan {
           result: operation.result,
           callbacks: operation.callbacks,
           streams: operation.streams,
+          stream_slot: operation.stream_slot,
           target,
         }
       })
@@ -411,7 +628,11 @@ fn validate_operation_shape(operation: &FamilyOperationInput) -> Result<(), Fami
   let receiver_kind = operation.receiver.map(|resource| resource.kind);
   let required_receiver = matches!(
     operation.kind,
-    OperationKind::Method | OperationKind::OutputStreamNext | OperationKind::OutputStreamCancel
+    OperationKind::Method
+      | OperationKind::InputStreamPull
+      | OperationKind::InputStreamCancel
+      | OperationKind::OutputStreamNext
+      | OperationKind::OutputStreamCancel
   );
   if required_receiver && receiver_kind.is_none() {
     return Err(FamilyPlanError::MissingReceiver { id: operation.id });
@@ -420,6 +641,13 @@ fn validate_operation_shape(operation: &FamilyOperationInput) -> Result<(), Fami
     return Err(FamilyPlanError::UnexpectedReceiver { id: operation.id });
   }
   if matches!(operation.kind, OperationKind::Method) && receiver_kind != Some(ResourceKind::Object)
+  {
+    return Err(FamilyPlanError::WrongReceiverKind { id: operation.id });
+  }
+  if matches!(
+    operation.kind,
+    OperationKind::InputStreamPull | OperationKind::InputStreamCancel
+  ) && receiver_kind != Some(ResourceKind::InputStream)
   {
     return Err(FamilyPlanError::WrongReceiverKind { id: operation.id });
   }
@@ -435,27 +663,30 @@ fn validate_operation_shape(operation: &FamilyOperationInput) -> Result<(), Fami
   {
     return Err(FamilyPlanError::MissingResultResource { id: operation.id });
   }
+  let dispatch_matches_kind = match operation.kind {
+    OperationKind::CallbackMethod => {
+      matches!(operation.dispatch, OperationDispatch::CallbackHost { .. })
+    }
+    OperationKind::InputStreamPull => operation.dispatch == OperationDispatch::InputStreamHostPull,
+    OperationKind::InputStreamCancel => {
+      operation.dispatch == OperationDispatch::InputStreamHostCancel
+    }
+    OperationKind::Function
+    | OperationKind::Constructor
+    | OperationKind::Method
+    | OperationKind::OutputStreamStart
+    | OperationKind::OutputStreamNext
+    | OperationKind::OutputStreamCancel => operation.dispatch == OperationDispatch::Native,
+  };
+  if !dispatch_matches_kind {
+    return Err(FamilyPlanError::WrongDispatch { id: operation.id });
+  }
   if matches!(
     operation.kind,
-    OperationKind::InputStreamPull | OperationKind::InputStreamCancel
-  ) && operation.dispatch
-    != match operation.kind {
-      OperationKind::InputStreamPull => OperationDispatch::InputStreamHostPull,
-      OperationKind::InputStreamCancel => OperationDispatch::InputStreamHostCancel,
-      _ => unreachable!(),
-    }
+    OperationKind::InputStreamCancel | OperationKind::OutputStreamCancel
+  ) && operation.result.is_some()
   {
-    return Err(FamilyPlanError::WrongDispatch { id: operation.id });
-  }
-  if matches!(operation.dispatch, OperationDispatch::CallbackHost { .. })
-    && operation.kind != OperationKind::CallbackMethod
-  {
-    return Err(FamilyPlanError::WrongDispatch { id: operation.id });
-  }
-  if operation.kind == OperationKind::CallbackMethod
-    && !matches!(operation.dispatch, OperationDispatch::CallbackHost { .. })
-  {
-    return Err(FamilyPlanError::WrongDispatch { id: operation.id });
+    return Err(FamilyPlanError::CancelHasResult { id: operation.id });
   }
   if matches!(
     operation.dispatch,
@@ -519,6 +750,13 @@ fn add_runtime_entrypoints(
 ) {
   if operation.receiver.map(|resource| resource.kind) == Some(ResourceKind::Object) {
     entrypoints.insert(RuntimeEntrypoint::ReleaseObject);
+  }
+  if operation.receiver.map(|resource| resource.kind) == Some(ResourceKind::InputStream) {
+    entrypoints.extend([
+      RuntimeEntrypoint::PullInputStream,
+      RuntimeEntrypoint::CancelInputStream,
+      RuntimeEntrypoint::ReleaseInputStream,
+    ]);
   }
   if operation.receiver.map(|resource| resource.kind) == Some(ResourceKind::OutputStream) {
     entrypoints.extend([
@@ -585,6 +823,9 @@ pub enum FamilyPlanError {
   HostOperationMustBeAsync {
     id: u32,
   },
+  CancelHasResult {
+    id: u32,
+  },
   UseSiteOperationMismatch {
     expected: u32,
     actual: u32,
@@ -607,6 +848,43 @@ pub enum FamilyPlanError {
     argument: u32,
     count: usize,
     role: &'static str,
+  },
+  DuplicateStreamUseSite {
+    use_site_id: u32,
+  },
+  NonDenseStreamUseSiteId,
+  DuplicateStreamSlot {
+    use_site_id: u32,
+    kind: OperationKind,
+  },
+  StreamSlotOperationMismatch {
+    expected: u32,
+    actual: u32,
+  },
+  StreamSlotKindMismatch {
+    operation_id: u32,
+    expected: OperationKind,
+    actual: OperationKind,
+  },
+  StreamSlotUseSiteMismatch {
+    expected: u32,
+    actual: u32,
+  },
+  UnknownStreamSlotOperation {
+    use_site_id: u32,
+    operation_id: u32,
+  },
+  StreamSlotIdentityMismatch {
+    use_site_id: u32,
+    operation_id: u32,
+  },
+  InvalidStreamSlot {
+    id: u32,
+  },
+  OrphanStreamSlot {
+    use_site_id: u32,
+    operation_id: u32,
+    kind: OperationKind,
   },
 }
 
@@ -643,6 +921,12 @@ impl fmt::Display for FamilyPlanError {
       Self::HostOperationMustBeAsync { id } => {
         write!(formatter, "host stream operation {id} must be async")
       }
+      Self::CancelHasResult { id } => {
+        write!(
+          formatter,
+          "stream cancel operation {id} must not return a payload"
+        )
+      }
       Self::UseSiteOperationMismatch {
         expected,
         actual,
@@ -669,6 +953,55 @@ impl fmt::Display for FamilyPlanError {
       } => write!(
         formatter,
         "operation {id} {role} path argument {argument} is outside {count} arguments"
+      ),
+      Self::DuplicateStreamUseSite { use_site_id } => {
+        write!(formatter, "duplicate stream use-site ID {use_site_id}")
+      }
+      Self::NonDenseStreamUseSiteId => formatter.write_str("stream use-site IDs are not dense"),
+      Self::DuplicateStreamSlot { use_site_id, kind } => write!(
+        formatter,
+        "stream use-site {use_site_id} has duplicate {kind:?} slot"
+      ),
+      Self::StreamSlotOperationMismatch { expected, actual } => write!(
+        formatter,
+        "stream slot operation ID {actual} does not match operation {expected}"
+      ),
+      Self::StreamSlotKindMismatch {
+        operation_id,
+        expected,
+        actual,
+      } => write!(
+        formatter,
+        "stream slot for operation {operation_id} has kind {actual:?}, expected {expected:?}"
+      ),
+      Self::StreamSlotUseSiteMismatch { expected, actual } => write!(
+        formatter,
+        "stream slot use-site ID {actual} does not match use-site {expected}"
+      ),
+      Self::UnknownStreamSlotOperation {
+        use_site_id,
+        operation_id,
+      } => write!(
+        formatter,
+        "stream use-site {use_site_id} references unknown slot operation {operation_id}"
+      ),
+      Self::StreamSlotIdentityMismatch {
+        use_site_id,
+        operation_id,
+      } => write!(
+        formatter,
+        "stream use-site {use_site_id} slot operation {operation_id} has mismatched identity"
+      ),
+      Self::InvalidStreamSlot { id } => {
+        write!(formatter, "operation {id} has an invalid stream slot")
+      }
+      Self::OrphanStreamSlot {
+        use_site_id,
+        operation_id,
+        kind,
+      } => write!(
+        formatter,
+        "stream slot {kind:?} operation {operation_id} is not referenced by use-site {use_site_id}"
       ),
     }
   }
@@ -757,6 +1090,7 @@ mod tests {
       result: None,
       callbacks: Vec::new(),
       streams: Vec::new(),
+      stream_slot: None,
     }
   }
 
@@ -813,6 +1147,19 @@ mod tests {
     })
     .unwrap_err();
     assert!(bad.to_string().contains("incompatible host dispatch"));
+
+    let mut misplaced_host = operation(
+      0,
+      OperationKind::Function,
+      OperationDispatch::InputStreamHostPull,
+    );
+    misplaced_host.async_kind = AsyncKind::Async;
+    let bad = FamilyPlan::build(FamilyPlanInput {
+      flavor: HostFlavor::Node,
+      operations: vec![misplaced_host],
+    })
+    .unwrap_err();
+    assert!(matches!(bad, FamilyPlanError::WrongDispatch { id: 0 }));
   }
 
   #[test]
@@ -831,12 +1178,105 @@ mod tests {
     });
     op.streams.push(StreamUseSite {
       operation_id: 0,
+      use_site_id: 0,
       path: ValuePath::argument(0),
       direction: StreamDirection::Input,
+      item: StreamValueBinding {
+        carrier: CarrierKind::Primitive,
+        conversion: ConversionRecipe::Identity,
+      },
+      error: StreamValueBinding {
+        carrier: CarrierKind::Primitive,
+        conversion: ConversionRecipe::Identity,
+      },
+      is_send: false,
+      slots: vec![
+        StreamSlotIdentity {
+          use_site_id: 0,
+          operation_id: 1,
+          kind: OperationKind::InputStreamPull,
+        },
+        StreamSlotIdentity {
+          use_site_id: 0,
+          operation_id: 2,
+          kind: OperationKind::InputStreamCancel,
+        },
+      ],
     });
+    let mut pull = operation(
+      1,
+      OperationKind::InputStreamPull,
+      OperationDispatch::InputStreamHostPull,
+    );
+    pull.async_kind = AsyncKind::Async;
+    pull.receiver = Some(ResourceBinding {
+      kind: ResourceKind::InputStream,
+      ownership: ResourceOwnership::Borrowed,
+    });
+    pull.stream_slot = Some(StreamSlotIdentity {
+      use_site_id: 0,
+      operation_id: 1,
+      kind: OperationKind::InputStreamPull,
+    });
+    let mut cancel = operation(
+      2,
+      OperationKind::InputStreamCancel,
+      OperationDispatch::InputStreamHostCancel,
+    );
+    cancel.async_kind = AsyncKind::Async;
+    cancel.receiver = Some(ResourceBinding {
+      kind: ResourceKind::InputStream,
+      ownership: ResourceOwnership::Borrowed,
+    });
+    cancel.stream_slot = Some(StreamSlotIdentity {
+      use_site_id: 0,
+      operation_id: 2,
+      kind: OperationKind::InputStreamCancel,
+    });
+    let mut bad_cancel = cancel.clone();
+    bad_cancel.result = Some(ResourceBinding {
+      kind: ResourceKind::OutputStream,
+      ownership: ResourceOwnership::Owned,
+    });
+    let error = FamilyPlan::build(FamilyPlanInput {
+      flavor: HostFlavor::Ohos,
+      operations: vec![op.clone(), pull.clone(), bad_cancel],
+    })
+    .unwrap_err();
+    assert!(matches!(error, FamilyPlanError::CancelHasResult { id: 2 }));
+    let mut orphan_owner = op.clone();
+    orphan_owner.streams.clear();
+    let error = FamilyPlan::build(FamilyPlanInput {
+      flavor: HostFlavor::Ohos,
+      operations: vec![orphan_owner, pull.clone(), cancel.clone()],
+    })
+    .unwrap_err();
+    assert!(matches!(
+      error,
+      FamilyPlanError::OrphanStreamSlot {
+        use_site_id: 0,
+        operation_id: 1,
+        kind: OperationKind::InputStreamPull,
+      }
+    ));
+    let mut mismatched_slot = cancel.clone();
+    mismatched_slot.stream_slot.as_mut().unwrap().kind = OperationKind::InputStreamPull;
+    let error = FamilyPlan::build(FamilyPlanInput {
+      flavor: HostFlavor::Ohos,
+      operations: vec![op.clone(), pull.clone(), mismatched_slot],
+    })
+    .unwrap_err();
+    assert!(matches!(
+      error,
+      FamilyPlanError::StreamSlotKindMismatch {
+        operation_id: 2,
+        expected: OperationKind::InputStreamCancel,
+        actual: OperationKind::InputStreamPull,
+      }
+    ));
     let plan = FamilyPlan::build(FamilyPlanInput {
       flavor: HostFlavor::Ohos,
-      operations: vec![op],
+      operations: vec![op, pull, cancel],
     })
     .unwrap();
     assert_eq!(plan.operations()[0].callbacks[0].callback_type_id, 7);

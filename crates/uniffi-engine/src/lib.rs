@@ -18,7 +18,7 @@ use napi_family_core::StreamDirection;
 use napi_family_core::{
   AsyncKind, BigIntWords, CallbackReentrancy, CallbackRetention, CallbackThreading,
   CallbackUseSite, FamilyOperation, FamilyOperationTarget, FamilyPlan, FamilyPlanError, HostFlavor,
-  OperationKind, ResourceKind, ResourceOwnership, ValuePathSegment,
+  OperationKind, ResourceKind, ResourceOwnership, ValuePath, ValuePathSegment,
 };
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
@@ -27,10 +27,11 @@ use syn::{Path, Type};
 pub use napi_family_core;
 mod session;
 pub use session::{
-  create_backend_session, SessionCallbackArgument, SessionCallbackReentrancy,
-  SessionCallbackRetention, SessionCallbackThreading, SessionNativeCall,
+  create_backend_session, take_session_callback_transfers, SessionCallbackArgument,
+  SessionCallbackLease, SessionCallbackReentrancy, SessionCallbackRetention,
+  SessionCallbackThreading, SessionCallbackTransfers, SessionNativeCall,
   SessionOperationDescriptor, SessionOperationDispatch, SessionResourceCallbacks,
-  SessionResourceReceiver, SessionStreamArgument, SessionStreamDirection,
+  SessionResourceReceiver, SessionStreamArgument, SessionStreamDirection, SessionValuePathSegment,
 };
 
 pub const BACKEND_FACTORY_EXPORT: &str = "__uniffi_backend_factory";
@@ -229,6 +230,13 @@ pub enum ArgumentBinding {
     carrier_type: Type,
     lower: Path,
   },
+  /// A structured lowerer that needs the session Host to construct nested
+  /// callback/stream proxies. The path itself is carried by the family plan;
+  /// this variant only supplies the Rust-side carrier and lowering hook.
+  LowerWithHost {
+    carrier_type: Type,
+    lower: Path,
+  },
   ObjectLease {
     carrier_type: Type,
     lower: Path,
@@ -254,6 +262,7 @@ impl ArgumentBinding {
     match self {
       Self::Direct { carrier_type }
       | Self::LowerWith { carrier_type, .. }
+      | Self::LowerWithHost { carrier_type, .. }
       | Self::ObjectLease { carrier_type, .. }
       | Self::OutputStreamLease { carrier_type, .. } => carrier_type.clone(),
       Self::I64BigInt | Self::U64BigInt => syn::parse_quote!(napi::bindgen_prelude::BigInt),
@@ -428,6 +437,10 @@ impl RustBridgePlan {
         return Err(EngineError::HostOperationHasRustBindings {
           operation_id: operation.operation_id,
         });
+      } else if !family_operation.callbacks.is_empty() || !family_operation.streams.is_empty() {
+        return Err(EngineError::HostOperationHasStructuredUseSites {
+          operation_id: operation.operation_id,
+        });
       }
       validated.push(operation);
     }
@@ -493,35 +506,94 @@ fn validate_structured_bindings(
   operation: &RustOperationPlan,
 ) -> Result<(), EngineError> {
   for (index, argument) in operation.arguments.iter().enumerate() {
-    let callback_path = family_operation.callbacks.iter().any(|use_site| {
-      matches!(
-        use_site.path.segments(),
-        [ValuePathSegment::Argument(argument_index)]
-          if *argument_index as usize == index
-      )
-    });
-    if callback_path && !matches!(argument.binding, ArgumentBinding::CallbackProxy { .. }) {
+    let callback_paths = family_operation
+      .callbacks
+      .iter()
+      .filter(|use_site| {
+        matches!(
+          use_site.path.segments().first(),
+          Some(ValuePathSegment::Argument(argument_index)) if *argument_index as usize == index
+        )
+      })
+      .collect::<Vec<_>>();
+    let direct_callback = callback_paths
+      .iter()
+      .any(|use_site| matches!(use_site.path.segments(), [ValuePathSegment::Argument(_)]));
+    let nested_callback = callback_paths
+      .iter()
+      .any(|use_site| use_site.path.segments().len() > 1);
+    let callback_proxy = matches!(argument.binding, ArgumentBinding::CallbackProxy { .. });
+    let lower_with_host = matches!(argument.binding, ArgumentBinding::LowerWithHost { .. });
+    if direct_callback != callback_proxy {
       return Err(EngineError::InvalidStructuredBinding {
         operation_id: operation.operation_id,
         argument: index,
         role: "callback",
       });
     }
-    let input_stream_path = family_operation.streams.iter().any(|use_site| {
-      use_site.direction == StreamDirection::Input
-        && matches!(
-          use_site.path.segments(),
-          [ValuePathSegment::Argument(argument_index)]
-            if *argument_index as usize == index
-        )
-    });
-    if input_stream_path && !matches!(argument.binding, ArgumentBinding::InputStreamProxy { .. }) {
+    let stream_paths = family_operation
+      .streams
+      .iter()
+      .filter(|use_site| {
+        use_site.direction == StreamDirection::Input
+          && matches!(
+            use_site.path.segments().first(),
+            Some(ValuePathSegment::Argument(argument_index)) if *argument_index as usize == index
+          )
+      })
+      .collect::<Vec<_>>();
+    let direct_stream = stream_paths
+      .iter()
+      .any(|use_site| matches!(use_site.path.segments(), [ValuePathSegment::Argument(_)]));
+    let nested_stream = stream_paths
+      .iter()
+      .any(|use_site| use_site.path.segments().len() > 1);
+    let input_stream_proxy = matches!(argument.binding, ArgumentBinding::InputStreamProxy { .. });
+    if direct_stream != input_stream_proxy {
       return Err(EngineError::InvalidStructuredBinding {
         operation_id: operation.operation_id,
         argument: index,
         role: "input stream",
       });
     }
+    let nested_structured = nested_callback || nested_stream;
+    if nested_structured != lower_with_host {
+      return Err(EngineError::InvalidStructuredBinding {
+        operation_id: operation.operation_id,
+        argument: index,
+        role: if nested_callback {
+          "callback"
+        } else if nested_stream {
+          "input stream"
+        } else {
+          "callback or input stream"
+        },
+      });
+    }
+  }
+
+  let return_callbacks = family_operation
+    .callbacks
+    .iter()
+    .filter(|use_site| {
+      matches!(
+        use_site.path.segments().first(),
+        Some(ValuePathSegment::Return)
+      )
+    })
+    .collect::<Vec<_>>();
+  let direct_return_callback = return_callbacks
+    .iter()
+    .any(|use_site| matches!(use_site.path.segments(), [ValuePathSegment::Return]));
+  let callback_lease = matches!(
+    operation.return_binding,
+    ReturnBinding::CallbackLease { .. }
+  );
+  if direct_return_callback != callback_lease {
+    return Err(EngineError::InvalidReturnBinding {
+      operation_id: operation.operation_id,
+      expected: "a direct callback lease matching the canonical return use-site",
+    });
   }
   Ok(())
 }
@@ -561,6 +633,7 @@ fn validate_receiver(
         | (ResourceKind::OutputStream, ArgumentBinding::OutputStreamLease { ownership, .. }) => {
           *ownership == expected.ownership
         }
+        (ResourceKind::InputStream, ArgumentBinding::InputStreamProxy { .. }) => true,
         _ => false,
       };
       if valid {
@@ -592,6 +665,7 @@ fn validate_result_resource(
     Some(ResourceKind::Object) => {
       matches!(operation.return_binding, ReturnBinding::ObjectLease { .. })
     }
+    Some(ResourceKind::InputStream) => false,
     Some(ResourceKind::OutputStream) => matches!(
       operation.return_binding,
       ReturnBinding::OutputStreamLease { .. }
@@ -698,12 +772,30 @@ fn generate_operation(
   let function_name = format_ident!("__uniffi_raw_operation_{id}");
   let callback_factory = format_ident!("_napi_rs_internal_register___uniffi_raw_operation_{id}");
   let return_carrier = operation.return_binding.carrier_type();
-  let requires_host = operation.arguments.iter().any(|argument| {
+  // Callback use-sites rooted at the native return are tracked by the
+  // session after settlement; they do not require a Host argument or a
+  // callback-transfer table in the generated async native function.  Only
+  // argument-rooted callbacks are lowered inside the native call itself.
+  let has_argument_callbacks = family.callbacks.iter().any(|use_site| {
     matches!(
-      argument.binding,
-      ArgumentBinding::CallbackProxy { .. } | ArgumentBinding::InputStreamProxy { .. }
+      use_site.path.segments().first(),
+      Some(ValuePathSegment::Argument(_))
     )
   });
+  let callback_transfer = has_argument_callbacks;
+  let requires_host = has_argument_callbacks
+    || family
+      .streams
+      .iter()
+      .any(|use_site| use_site.direction == StreamDirection::Input)
+    || operation.arguments.iter().any(|argument| {
+      matches!(
+        argument.binding,
+        ArgumentBinding::CallbackProxy { .. }
+          | ArgumentBinding::InputStreamProxy { .. }
+          | ArgumentBinding::LowerWithHost { .. }
+      )
+    });
   let mut function_builder = NapiFnBuilder::new(function_name.clone(), function_name.to_string());
   if requires_host {
     function_builder = function_builder.argument(NapiFnArg {
@@ -712,6 +804,14 @@ fn generate_operation(
       )),
       ts_arg_type: None,
     });
+  }
+  if callback_transfer {
+    for name in ["__uniffi_session_generation", "__uniffi_callback_transfer"] {
+      function_builder = function_builder.argument(NapiFnArg {
+        kind: NapiFnArgKind::PatType(Box::new(syn::parse_quote!(#name: u32))),
+        ts_arg_type: None,
+      });
+    }
   }
   function_builder = function_builder
     .return_type(syn::parse_quote!(napi_uniffi_engine::NapiCallResult<#return_carrier>))
@@ -792,6 +892,12 @@ fn generate_operation(
           Err(error) => return napi_uniffi_engine::NapiCallResult::Error(error),
         };
       }),
+      ArgumentBinding::LowerWithHost { lower, .. } => lowerings.push(quote! {
+        let #name = match #lower(&__uniffi_host, #name, &__uniffi_callback_transfers) {
+          Ok(value) => value,
+          Err(error) => return napi_uniffi_engine::NapiCallResult::Error(error),
+        };
+      }),
       ArgumentBinding::CallbackProxy { build, .. } => {
         let callback = family
           .callbacks
@@ -808,13 +914,28 @@ fn generate_operation(
             role: "callback",
           })?;
         let callback_type_id = callback.callback_type_id;
-        let contract = callback_contract_tokens(callback, argument_index as u32);
+        let contract = callback_contract_tokens(callback);
+        let callback_index = family
+          .callbacks
+          .iter()
+          .position(|candidate| std::ptr::eq(candidate, callback))
+          .expect("callback use-site belongs to family operation");
         lowerings.push(quote! {
+          let __uniffi_callback_lease = match __uniffi_callback_transfers.lease(
+            #callback_index,
+            0,
+          ) {
+            Ok(value) => value,
+            Err(error) => return napi_uniffi_engine::NapiCallResult::Error(
+              napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()),
+            ),
+          };
           let #name = match #build(
             &__uniffi_host,
             #callback_type_id,
             #name,
             #contract,
+            __uniffi_callback_lease,
           ) {
             Ok(value) => value,
             Err(error) => return napi_uniffi_engine::NapiCallResult::Error(error),
@@ -901,16 +1022,42 @@ fn generate_operation(
   });
   let host_declaration =
     requires_host.then(|| quote!(__uniffi_host: napi::bindgen_prelude::Object<'static>,));
+  let transfer_declaration = callback_transfer.then(|| {
+    quote! {
+      __uniffi_session_generation: u32,
+      __uniffi_callback_transfer: u32,
+    }
+  });
   let keep_host_alive = requires_host.then(|| quote!(let _ = &__uniffi_host;));
+  let callback_transfers = if callback_transfer {
+    quote! {
+      let __uniffi_callback_transfers = match napi_uniffi_engine::take_session_callback_transfers(
+        __uniffi_session_generation,
+        __uniffi_callback_transfer,
+      ) {
+        Ok(value) => value,
+        Err(error) => return napi_uniffi_engine::NapiCallResult::Error(
+          napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()),
+        ),
+      };
+    }
+  } else {
+    quote! {
+      let __uniffi_callback_transfers =
+        napi_uniffi_engine::SessionCallbackTransfers::empty();
+    }
+  };
   let return_carrier = operation.return_binding.carrier_type();
   let body = quote! {
     #[doc(hidden)]
     #async_token fn #function_name(
       #host_declaration
+      #transfer_declaration
       #(#receiver_declaration)*
       #(#argument_declarations),*
     ) -> napi_uniffi_engine::NapiCallResult<#return_carrier> {
       #keep_host_alive
+      #callback_transfers
       #(#lowerings)*
       #value
       napi_uniffi_engine::NapiCallResult::Value(#lift)
@@ -925,7 +1072,7 @@ fn generate_operation(
   })
 }
 
-fn callback_contract_tokens(use_site: &CallbackUseSite, argument_index: u32) -> TokenStream {
+fn callback_contract_tokens(use_site: &CallbackUseSite) -> TokenStream {
   let callback_type_id = use_site.callback_type_id;
   let retention = match use_site.contract.retention {
     CallbackRetention::Scoped => quote!(napi_uniffi_engine::SessionCallbackRetention::Scoped),
@@ -947,9 +1094,10 @@ fn callback_contract_tokens(use_site: &CallbackUseSite, argument_index: u32) -> 
       quote!(napi_uniffi_engine::SessionCallbackReentrancy::Forbidden)
     }
   };
+  let path_tokens = session_path_tokens(&use_site.path);
   quote! {
     napi_uniffi_engine::SessionCallbackArgument {
-      argument_index: #argument_index,
+      path: vec![#(#path_tokens),*],
       callback_type_id: #callback_type_id,
       retention: #retention,
       threading: #threading,
@@ -1170,6 +1318,16 @@ fn session_descriptor(
     Some(_)
       if matches!(
         operation.kind,
+        OperationKind::InputStreamPull | OperationKind::InputStreamCancel
+      ) =>
+    {
+      quote!(Some(
+        napi_uniffi_engine::SessionResourceReceiver::InputStream
+      ))
+    }
+    Some(_)
+      if matches!(
+        operation.kind,
         OperationKind::OutputStreamNext | OperationKind::OutputStreamCancel
       ) =>
     {
@@ -1179,7 +1337,29 @@ fn session_descriptor(
     }
     Some(_) => quote!(Some(napi_uniffi_engine::SessionResourceReceiver::Object)),
   };
-  let native_call = if operation.callbacks.is_empty()
+  let result = match operation.result.map(|resource| resource.kind) {
+    None => quote!(None),
+    Some(ResourceKind::Object) => {
+      quote!(Some(napi_uniffi_engine::SessionResourceReceiver::Object))
+    }
+    Some(ResourceKind::InputStream) => {
+      quote!(Some(
+        napi_uniffi_engine::SessionResourceReceiver::InputStream
+      ))
+    }
+    Some(ResourceKind::OutputStream) => {
+      quote!(Some(
+        napi_uniffi_engine::SessionResourceReceiver::OutputStream
+      ))
+    }
+  };
+  let has_argument_callbacks = operation.callbacks.iter().any(|use_site| {
+    matches!(
+      use_site.path.segments().first(),
+      Some(ValuePathSegment::Argument(_))
+    )
+  });
+  let native_call = if !has_argument_callbacks
     && !operation
       .streams
       .iter()
@@ -1193,13 +1373,17 @@ fn session_descriptor(
     .callbacks
     .iter()
     .map(|use_site| {
-      let [ValuePathSegment::Argument(argument_index)] = use_site.path.segments() else {
+      if !matches!(
+        use_site.path.segments().first(),
+        Some(ValuePathSegment::Argument(_) | ValuePathSegment::Return)
+      ) {
         return Err(EngineError::UnsupportedUseSite {
           operation_id,
           role: "callback",
           path: use_site.path.to_string(),
         });
-      };
+      }
+      let path_tokens = session_path_tokens(&use_site.path);
       let callback_type_id = use_site.callback_type_id;
       let retention = match use_site.contract.retention {
         CallbackRetention::Scoped => quote!(napi_uniffi_engine::SessionCallbackRetention::Scoped),
@@ -1225,7 +1409,7 @@ fn session_descriptor(
       };
       Ok(quote! {
         napi_uniffi_engine::SessionCallbackArgument {
-          argument_index: #argument_index,
+          path: vec![#(#path_tokens),*],
           callback_type_id: #callback_type_id,
           retention: #retention,
           threading: #threading,
@@ -1242,27 +1426,40 @@ fn session_descriptor(
       StreamDirection::Output => None,
     })
     .map(|use_site| {
-      let [ValuePathSegment::Argument(argument_index)] = use_site.path.segments() else {
+      let Some(ValuePathSegment::Argument(_)) = use_site.path.segments().first() else {
         return Err(EngineError::UnsupportedUseSite {
           operation_id,
           role: "input stream",
           path: use_site.path.to_string(),
         });
       };
+      let path_tokens = session_path_tokens(&use_site.path);
+      let use_site_id = use_site.use_site_id;
       Ok(quote! {
         napi_uniffi_engine::SessionStreamArgument {
-          argument_index: #argument_index,
+          path: vec![#(#path_tokens),*],
+          use_site_id: #use_site_id,
           direction: napi_uniffi_engine::SessionStreamDirection::Input,
         }
       })
     })
     .collect::<Result<Vec<_>, _>>()?;
+  let callback_transfer = operation.target == FamilyOperationTarget::Native
+    && operation.callbacks.iter().any(|use_site| {
+      matches!(
+        use_site.path.segments().first(),
+        Some(ValuePathSegment::Argument(_))
+      )
+    });
   for use_site in operation
     .streams
     .iter()
     .filter(|use_site| use_site.direction == StreamDirection::Output)
   {
-    if !matches!(use_site.path.segments(), [ValuePathSegment::Return]) {
+    if !matches!(
+      use_site.path.segments().first(),
+      Some(ValuePathSegment::Return)
+    ) {
       return Err(EngineError::UnsupportedUseSite {
         operation_id,
         role: "output stream",
@@ -1277,10 +1474,42 @@ fn session_descriptor(
       callback: #callback,
       native_call: #native_call,
       receiver: #receiver,
+      result: #result,
+      callback_transfer: #callback_transfer,
       callback_arguments: vec![#(#callback_arguments),*],
       stream_arguments: vec![#(#stream_arguments),*],
     }
   })
+}
+
+fn session_path_tokens(path: &ValuePath) -> Vec<TokenStream> {
+  path
+    .segments()
+    .iter()
+    .map(|segment| match segment {
+      ValuePathSegment::Argument(index) => {
+        quote!(napi_uniffi_engine::SessionValuePathSegment::Argument(#index))
+      }
+      ValuePathSegment::Return => quote!(napi_uniffi_engine::SessionValuePathSegment::Return),
+      ValuePathSegment::Field(name) => {
+        quote!(napi_uniffi_engine::SessionValuePathSegment::Field(#name.to_owned()))
+      }
+      ValuePathSegment::Variant(name) => {
+        quote!(napi_uniffi_engine::SessionValuePathSegment::Variant(#name.to_owned()))
+      }
+      ValuePathSegment::Optional => {
+        quote!(napi_uniffi_engine::SessionValuePathSegment::Optional)
+      }
+      ValuePathSegment::SequenceElement => {
+        quote!(napi_uniffi_engine::SessionValuePathSegment::SequenceElement)
+      }
+      ValuePathSegment::MapKey => quote!(napi_uniffi_engine::SessionValuePathSegment::MapKey),
+      ValuePathSegment::MapValue => quote!(napi_uniffi_engine::SessionValuePathSegment::MapValue),
+      ValuePathSegment::SetElement => {
+        quote!(napi_uniffi_engine::SessionValuePathSegment::SetElement)
+      }
+    })
+    .collect()
 }
 
 #[derive(Debug)]
@@ -1331,6 +1560,9 @@ pub enum EngineError {
     kind: OperationKind,
   },
   HostOperationHasRustBindings {
+    operation_id: u32,
+  },
+  HostOperationHasStructuredUseSites {
     operation_id: u32,
   },
   MissingObjectReceiver {
@@ -1439,6 +1671,10 @@ impl fmt::Display for EngineError {
       Self::HostOperationHasRustBindings { operation_id } => write!(
         formatter,
         "host operation {operation_id} must not contain Rust call arguments or a receiver"
+      ),
+      Self::HostOperationHasStructuredUseSites { operation_id } => write!(
+        formatter,
+        "host operation {operation_id} must not contain callback or stream use-sites"
       ),
       Self::MissingObjectReceiver { operation_id } => {
         write!(
