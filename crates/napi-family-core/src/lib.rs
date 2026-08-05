@@ -160,6 +160,18 @@ pub enum OperationDispatch {
 pub enum ValuePathSegment {
   Argument(u32),
   Return,
+  /// Select the payload of a canonical output-stream `item` step.
+  ///
+  /// This selector is only valid immediately below a `Return` root on an
+  /// `OutputStreamNext` operation.  Keeping the step branch in the path
+  /// model lets the session use the same resource walker for object-bearing
+  /// stream values as for ordinary operation returns.
+  StreamItem,
+  /// Select the payload of a canonical output-stream `error` step.
+  ///
+  /// This selector is only valid immediately below a `Return` root on an
+  /// `OutputStreamNext` operation.
+  StreamError,
   Field(String),
   Variant(String),
   Optional,
@@ -245,6 +257,8 @@ impl fmt::Display for ValuePath {
       match segment {
         ValuePathSegment::Argument(index) => write!(formatter, "argument[{index}]")?,
         ValuePathSegment::Return => formatter.write_str("return")?,
+        ValuePathSegment::StreamItem => formatter.write_str("stream-item")?,
+        ValuePathSegment::StreamError => formatter.write_str("stream-error")?,
         ValuePathSegment::Field(name) => write!(formatter, "field[{name}]")?,
         ValuePathSegment::Variant(name) => write!(formatter, "variant[{name}]")?,
         ValuePathSegment::Optional => formatter.write_str("optional")?,
@@ -842,6 +856,29 @@ fn validate_result_resource_path(
       role: "result resource",
     });
   }
+  let mut stream_selector = None;
+  for (index, segment) in path.segments().iter().skip(1).enumerate() {
+    let selector = match segment {
+      ValuePathSegment::StreamItem => Some("StreamItem"),
+      ValuePathSegment::StreamError => Some("StreamError"),
+      _ => None,
+    };
+    let Some(selector) = selector else {
+      continue;
+    };
+    if operation.kind != OperationKind::OutputStreamNext || index != 0 {
+      return Err(FamilyPlanError::InvalidStreamStepPath {
+        id: operation.id,
+        role: "result resource",
+      });
+    }
+    if stream_selector.replace(selector).is_some() {
+      return Err(FamilyPlanError::InvalidStreamStepPath {
+        id: operation.id,
+        role: "result resource",
+      });
+    }
+  }
   Ok(())
 }
 
@@ -883,6 +920,17 @@ fn validate_path(
     )
   }) {
     return Err(FamilyPlanError::NestedRootSegment {
+      id: operation.id,
+      role,
+    });
+  }
+  if path.segments().iter().any(|segment| {
+    matches!(
+      segment,
+      ValuePathSegment::StreamItem | ValuePathSegment::StreamError
+    )
+  }) {
+    return Err(FamilyPlanError::InvalidStreamStepPath {
       id: operation.id,
       role,
     });
@@ -1027,6 +1075,10 @@ pub enum FamilyPlanError {
     id: u32,
     role: &'static str,
   },
+  InvalidStreamStepPath {
+    id: u32,
+    role: &'static str,
+  },
   ArgumentPathOutOfRange {
     id: u32,
     argument: u32,
@@ -1146,6 +1198,10 @@ impl fmt::Display for FamilyPlanError {
           "operation {id} has a nested root segment in its {role} path"
         )
       }
+      Self::InvalidStreamStepPath { id, role } => write!(
+        formatter,
+        "operation {id} has an invalid stream-step selector in its {role} path"
+      ),
       Self::ArgumentPathOutOfRange {
         id,
         argument,
@@ -1802,6 +1858,120 @@ mod tests {
         operations: vec![conflict],
       }),
       Err(FamilyPlanError::ConflictingResultResourceUseSite { .. })
+    ));
+  }
+
+  #[test]
+  fn output_stream_step_selectors_are_first_class_and_strictly_placed() {
+    let mut next = operation(
+      0,
+      OperationKind::OutputStreamNext,
+      OperationDispatch::Native,
+    );
+    next.async_kind = AsyncKind::Async;
+    next.receiver = Some(ReceiverBinding::Resource(ResourceBinding {
+      kind: ResourceKind::OutputStream,
+      ownership: ResourceOwnership::Borrowed,
+    }));
+    next.result_resources.push(ResultResourceUseSite {
+      operation_id: 0,
+      path: ValuePath::new(vec![
+        ValuePathSegment::Return,
+        ValuePathSegment::StreamItem,
+        ValuePathSegment::Field("object".to_owned()),
+      ]),
+      binding: ResourceBinding {
+        kind: ResourceKind::Object,
+        ownership: ResourceOwnership::Owned,
+      },
+    });
+    let plan = FamilyPlan::build(FamilyPlanInput {
+      flavor: HostFlavor::Node,
+      close_policy: TEST_CLOSE_POLICY,
+      operations: vec![next.clone()],
+    })
+    .unwrap();
+    assert_eq!(
+      plan.operations()[0].result_resources[0].path.to_string(),
+      "return.stream-item.field[object]"
+    );
+
+    let mut error_path = next.clone();
+    error_path.result_resources[0].path = ValuePath::new(vec![
+      ValuePathSegment::Return,
+      ValuePathSegment::StreamError,
+      ValuePathSegment::Field("object".to_owned()),
+    ]);
+    FamilyPlan::build(FamilyPlanInput {
+      flavor: HostFlavor::Ohos,
+      close_policy: TEST_CLOSE_POLICY,
+      operations: vec![error_path],
+    })
+    .unwrap();
+
+    let mut wrong_operation = next.clone();
+    wrong_operation.kind = OperationKind::Function;
+    wrong_operation.receiver = None;
+    assert!(matches!(
+      FamilyPlan::build(FamilyPlanInput {
+        flavor: HostFlavor::Node,
+        close_policy: TEST_CLOSE_POLICY,
+        operations: vec![wrong_operation],
+      }),
+      Err(FamilyPlanError::InvalidStreamStepPath {
+        id: 0,
+        role: "result resource"
+      })
+    ));
+
+    let mut nested = next.clone();
+    nested.result_resources[0].path = ValuePath::new(vec![
+      ValuePathSegment::Return,
+      ValuePathSegment::Field("step".to_owned()),
+      ValuePathSegment::StreamItem,
+    ]);
+    assert!(matches!(
+      FamilyPlan::build(FamilyPlanInput {
+        flavor: HostFlavor::Node,
+        close_policy: TEST_CLOSE_POLICY,
+        operations: vec![nested],
+      }),
+      Err(FamilyPlanError::InvalidStreamStepPath { .. })
+    ));
+
+    let mut duplicate = next;
+    duplicate.result_resources[0].path = ValuePath::new(vec![
+      ValuePathSegment::Return,
+      ValuePathSegment::StreamItem,
+      ValuePathSegment::StreamError,
+    ]);
+    assert!(matches!(
+      FamilyPlan::build(FamilyPlanInput {
+        flavor: HostFlavor::Node,
+        close_policy: TEST_CLOSE_POLICY,
+        operations: vec![duplicate],
+      }),
+      Err(FamilyPlanError::InvalidStreamStepPath { .. })
+    ));
+
+    let mut callback = operation(0, OperationKind::Function, OperationDispatch::Native);
+    callback.callbacks.push(CallbackUseSite {
+      operation_id: 0,
+      callback_type_id: 1,
+      path: ValuePath::new(vec![ValuePathSegment::Return, ValuePathSegment::StreamItem]),
+      contract: CallbackContract {
+        retention: CallbackRetention::Scoped,
+        threading: CallbackThreading::CallingThread,
+        reentrancy: CallbackReentrancy::Allowed,
+      },
+    });
+    assert!(matches!(
+      FamilyPlan::build(FamilyPlanInput {
+        flavor: HostFlavor::Node,
+        close_policy: TEST_CLOSE_POLICY,
+        operations: vec![callback],
+      }),
+      Err(FamilyPlanError::InvalidStreamStepPath { .. })
     ));
   }
 }

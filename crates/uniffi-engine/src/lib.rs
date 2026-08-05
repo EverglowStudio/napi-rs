@@ -1780,6 +1780,12 @@ fn session_path_tokens(path: &ValuePath) -> Vec<TokenStream> {
         quote!(napi_uniffi_engine::SessionValuePathSegment::Argument(#index))
       }
       ValuePathSegment::Return => quote!(napi_uniffi_engine::SessionValuePathSegment::Return),
+      ValuePathSegment::StreamItem => {
+        quote!(napi_uniffi_engine::SessionValuePathSegment::StreamItem)
+      }
+      ValuePathSegment::StreamError => {
+        quote!(napi_uniffi_engine::SessionValuePathSegment::StreamError)
+      }
       ValuePathSegment::Field(name) => {
         quote!(napi_uniffi_engine::SessionValuePathSegment::Field(#name.to_owned()))
       }
