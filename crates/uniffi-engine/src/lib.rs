@@ -29,8 +29,8 @@ pub use napi_family_core::{ClosePolicy, DeadlineAction};
 mod session;
 pub use session::{
   create_backend_session, take_session_callback_transfers, SessionCallbackArgument,
-  SessionCallbackLease, SessionCallbackReentrancy, SessionCallbackRetention,
-  SessionCallbackThreading, SessionCallbackTransfers, SessionNativeCall,
+  SessionCallbackInvoker, SessionCallbackLease, SessionCallbackReentrancy,
+  SessionCallbackRetention, SessionCallbackThreading, SessionCallbackTransfers, SessionNativeCall,
   SessionOperationDescriptor, SessionOperationDispatch, SessionReceiver, SessionResourceCallbacks,
   SessionResourceOwnership, SessionResourceReceiver, SessionResultResourceUseSite,
   SessionStreamArgument, SessionStreamDirection, SessionValuePathSegment,
@@ -1119,25 +1119,40 @@ fn generate_operation(
           napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string())
         ));
         let build_error = lower_error(quote!(error));
-        lowerings.push(quote! {
-          let __uniffi_callback_lease = match __uniffi_callback_transfers.lease(
-            #callback_index,
-            0,
-          ) {
-            Ok(value) => value,
-            Err(error) => #lease_error,
-          };
-          let #name = match #build(
-            &__uniffi_host,
-            #callback_type_id,
-            #name,
-            #contract,
-            __uniffi_callback_lease,
-          ) {
-            Ok(value) => value,
-            Err(error) => #build_error,
-          };
-        });
+        match callback.contract.retention {
+          CallbackRetention::Scoped => lowerings.push(quote! {
+            let #name = match #build(
+              &__uniffi_host,
+              #callback_type_id,
+              #name,
+              #contract,
+              __uniffi_callback_invoker.clone(),
+            ) {
+              Ok(value) => value,
+              Err(error) => #build_error,
+            };
+          }),
+          CallbackRetention::Retained => lowerings.push(quote! {
+            let __uniffi_callback_lease = match __uniffi_callback_transfers.lease(
+              #callback_index,
+              0,
+            ) {
+              Ok(value) => value,
+              Err(error) => #lease_error,
+            };
+            let #name = match #build(
+              &__uniffi_host,
+              #callback_type_id,
+              #name,
+              #contract,
+              __uniffi_callback_invoker.clone(),
+              __uniffi_callback_lease,
+            ) {
+              Ok(value) => value,
+              Err(error) => #build_error,
+            };
+          }),
+        }
       }
       ArgumentBinding::InputStreamProxy { build, .. } => {
         let found = family.streams.iter().any(|use_site| {
@@ -1271,6 +1286,10 @@ fn generate_operation(
         __uniffi_session_generation,
         __uniffi_callback_transfer,
       ) {
+        Ok(value) => value,
+        Err(error) => #error,
+      };
+      let __uniffi_callback_invoker = match __uniffi_callback_transfers.invoker() {
         Ok(value) => value,
         Err(error) => #error,
       };

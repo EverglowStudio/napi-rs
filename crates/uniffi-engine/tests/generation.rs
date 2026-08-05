@@ -490,6 +490,8 @@ fn generates_dense_private_operations_and_one_factory() {
     "require_lossless_i64",
     "require_lossless_u64",
     "build_callback_proxy",
+    "callback_transfers . invoker ()",
+    "__uniffi_callback_lease",
     "lift_output_stream",
     "build_input_stream_proxy",
     "lower_object",
@@ -500,6 +502,62 @@ fn generates_dense_private_operations_and_one_factory() {
     );
   }
   assert!(syn::parse2::<syn::File>(generated.source().clone()).is_ok());
+}
+
+#[test]
+fn callback_proxy_builder_uses_invoker_without_scoped_lease() {
+  let operation = FamilyOperationInput {
+    id: 0,
+    kind: OperationKind::Function,
+    async_kind: AsyncKind::Sync,
+    fallible: false,
+    argument_count: 1,
+    dispatch: OperationDispatch::Native,
+    receiver: None,
+    result_resources: Vec::new(),
+    callbacks: vec![CallbackUseSite {
+      operation_id: 0,
+      callback_type_id: 11,
+      path: ValuePath::argument(0),
+      contract: CallbackContract {
+        retention: CallbackRetention::Scoped,
+        threading: CallbackThreading::CallingThread,
+        reentrancy: CallbackReentrancy::Allowed,
+      },
+    }],
+    streams: Vec::new(),
+    stream_slot: None,
+  };
+  let family = FamilyPlan::build(FamilyPlanInput {
+    flavor: HostFlavor::Node,
+    close_policy: TEST_CLOSE_POLICY,
+    operations: vec![operation],
+  })
+  .unwrap();
+  let plan = RustBridgePlan::build(
+    &family,
+    vec![native(
+      0,
+      syn::parse_quote!(fixture::observe),
+      vec![argument(
+        "callback",
+        ArgumentBinding::CallbackProxy {
+          rust_type: syn::parse_quote!(fixture::Callback),
+          build: syn::parse_quote!(fixture::build_callback_proxy),
+        },
+      )],
+      ReturnBinding::Unit,
+      ErrorBinding::Infallible,
+    )],
+  )
+  .unwrap();
+  let source = generate_napi_module(&family, &plan)
+    .unwrap()
+    .source()
+    .to_string();
+  assert!(source.contains("callback_transfers . invoker ()"));
+  assert!(source.contains("__uniffi_callback_invoker . clone ()"));
+  assert!(!source.contains("__uniffi_callback_lease"));
 }
 
 #[test]

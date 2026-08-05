@@ -1399,6 +1399,28 @@ fn family() -> FamilyPlan {
       streams: Vec::new(),
       stream_slot: None,
     },
+    FamilyOperationInput {
+      id: 54,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Async,
+      fallible: true,
+      argument_count: 1,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result_resources: Vec::new(),
+      callbacks: vec![CallbackUseSite {
+        operation_id: 54,
+        callback_type_id: 0,
+        path: ValuePath::argument(0),
+        contract: CallbackContract {
+          retention: CallbackRetention::Scoped,
+          threading: CallbackThreading::MayCrossThread,
+          reentrancy: CallbackReentrancy::Allowed,
+        },
+      }],
+      streams: Vec::new(),
+      stream_slot: None,
+    },
   ]);
   operations[5].receiver = Some(ReceiverBinding::Resource(ResourceBinding {
     kind: ResourceKind::InputStream,
@@ -2173,6 +2195,26 @@ fn plan(family: &FamilyPlan) -> RustBridgePlan {
       },
       error_binding: ErrorBinding::Infallible,
     },
+    RustOperationPlan {
+      operation_id: id(54),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::invoke_scoped_callback),
+      },
+      receiver: None,
+      arguments: vec![RustArgumentPlan {
+        name: Ident::new("callback", Span::call_site()),
+        binding: ArgumentBinding::CallbackProxy {
+          rust_type: syn::parse_quote!(fixture::ScopedAsyncProxy),
+          build: syn::parse_quote!(fixture::build_scoped_async_proxy),
+        },
+      }],
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      error_binding: ErrorBinding::Descriptor {
+        map: syn::parse_quote!(fixture::map_error),
+      },
+    },
   ];
   RustBridgePlan::build_with_resource_hooks(
     family,
@@ -2286,7 +2328,7 @@ unsafe impl AsyncRuntime for FixtureRuntime {{
 fn install_runtime() {{ register_async_runtime(FixtureRuntime {{ active: AtomicBool::new(false), workers: Mutex::new(Vec::new()) }}); }}
 
 mod fixture {{
-  use napi::bindgen_prelude::{{Function, JsObjectValue, Object}};
+  use napi::bindgen_prelude::{{Function, FnArgs, JsObjectValue, Object, Promise}};
   use napi::threadsafe_function::{{ThreadsafeFunction, ThreadsafeFunctionCallMode}};
   use napi_derive::napi;
   use std::sync::{{atomic::{{AtomicBool, AtomicU32, Ordering}}, Arc, Mutex}};
@@ -2323,6 +2365,8 @@ mod fixture {{
     pub inputs: Vec<u32>,
     pub variant: NestedInputVariant,
   }}
+  #[napi(object)]
+  pub struct CallbackEnvelope {{ pub kind: String, pub value: u32 }}
   static OBJECT_RELEASES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
   static OUTPUT_CANCELS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
   static OUTPUT_RELEASES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
@@ -2347,6 +2391,9 @@ mod fixture {{
   pub struct HostCallProxy {{ inner: Arc<HostCallProxyInner> }}
   struct TwoHostCallProxyInner {{ id: u32, first: Mutex<Option<ThreadsafeFunction<u32, (), u32, napi::Status, false>>>, second: Mutex<Option<ThreadsafeFunction<u32, (), u32, napi::Status, false>>>, _lease: napi_uniffi_engine::SessionCallbackLease }}
   pub struct TwoHostCallProxy {{ inner: Arc<TwoHostCallProxyInner> }}
+  type ScopedCallbackArgs = FnArgs<(u32, u32, u32, u32, Vec<u32>)>;
+  type ScopedCallbackTsfn = ThreadsafeFunction<ScopedCallbackArgs, Promise<CallbackEnvelope>, ScopedCallbackArgs, napi::Status, false>;
+  pub struct ScopedAsyncProxy {{ id: u32, invoker: napi_uniffi_engine::SessionCallbackInvoker, callback: Arc<ScopedCallbackTsfn> }}
 
   pub struct RecordValue {{ amount: u32 }}
   pub enum EnumValue {{ Ready(u32), Other }}
@@ -2415,8 +2462,18 @@ mod fixture {{
     }}
   }}
   pub fn enum_value_method(value: EnumValue) -> u32 {{ match value {{ EnumValue::Ready(amount) => amount + 2, EnumValue::Other => 0 }} }}
-  pub fn build_callback_proxy(_host: &napi::bindgen_prelude::Object<'static>, callback_type_id: u32, callback_id: u32, contract: napi_uniffi_engine::SessionCallbackArgument, lease: napi_uniffi_engine::SessionCallbackLease) -> Result<CallbackProxy, napi_uniffi_engine::BridgeErrorDescriptor> {{
+  pub fn build_callback_proxy(_host: &napi::bindgen_prelude::Object<'static>, callback_type_id: u32, callback_id: u32, contract: napi_uniffi_engine::SessionCallbackArgument, _invoker: napi_uniffi_engine::SessionCallbackInvoker, lease: napi_uniffi_engine::SessionCallbackLease) -> Result<CallbackProxy, napi_uniffi_engine::BridgeErrorDescriptor> {{
     assert_eq!(callback_type_id, 0); assert_eq!(contract.callback_type_id, 0); assert_eq!(contract.retention, napi_uniffi_engine::SessionCallbackRetention::Retained); assert_eq!(contract.threading, napi_uniffi_engine::SessionCallbackThreading::MayCrossThread); assert_eq!(contract.reentrancy, napi_uniffi_engine::SessionCallbackReentrancy::Allowed); Ok(CallbackProxy {{ id: callback_id, lease }})
+  }}
+  pub fn build_scoped_async_proxy(host: &Object<'static>, callback_type_id: u32, callback_id: u32, contract: napi_uniffi_engine::SessionCallbackArgument, invoker: napi_uniffi_engine::SessionCallbackInvoker) -> Result<ScopedAsyncProxy, napi_uniffi_engine::BridgeErrorDescriptor> {{
+    assert_eq!(callback_type_id, 0); assert_eq!(contract.callback_type_id, 0); assert_eq!(contract.retention, napi_uniffi_engine::SessionCallbackRetention::Scoped); assert_eq!(contract.threading, napi_uniffi_engine::SessionCallbackThreading::MayCrossThread); assert_eq!(contract.reentrancy, napi_uniffi_engine::SessionCallbackReentrancy::Allowed);
+    let callback = host.get_named_property::<Function<'static, ScopedCallbackArgs, Promise<CallbackEnvelope>>>("invokeCallbackAsync").map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?.build_threadsafe_function().build().map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?;
+    Ok(ScopedAsyncProxy {{ id: callback_id, invoker, callback: Arc::new(callback) }})
+  }}
+  pub async fn invoke_scoped_callback(proxy: ScopedAsyncProxy) -> Result<u32, napi_uniffi_engine::BridgeErrorDescriptor> {{
+    let invocation_id = proxy.invoker.next_invocation_id().map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::backend(error.to_string()))?;
+    let result = proxy.callback.call_async(ScopedCallbackArgs::from((0, proxy.id, 0, invocation_id, vec![proxy.id]))).await.map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::backend(error.to_string()))?;
+    Ok(result.await.map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::backend(error.to_string()))?.value)
   }}
   pub fn hold_callback(proxy: CallbackProxy) -> u32 {{
     let id = proxy.id;
@@ -2456,12 +2513,12 @@ mod fixture {{
   }}
   pub fn observe(callback_id: u32) -> u32 {{ callback_id }}
   pub fn build_input_stream_proxy(_host: &napi::bindgen_prelude::Object<'static>, stream_id: u32) -> Result<u32, napi_uniffi_engine::BridgeErrorDescriptor> {{ Ok(stream_id) }}
-  pub fn build_host_call_proxy(host: &Object<'static>, _callback_type_id: u32, callback_id: u32, _contract: napi_uniffi_engine::SessionCallbackArgument, lease: napi_uniffi_engine::SessionCallbackLease) -> Result<HostCallProxy, napi_uniffi_engine::BridgeErrorDescriptor> {{
+  pub fn build_host_call_proxy(host: &Object<'static>, _callback_type_id: u32, callback_id: u32, _contract: napi_uniffi_engine::SessionCallbackArgument, _invoker: napi_uniffi_engine::SessionCallbackInvoker, lease: napi_uniffi_engine::SessionCallbackLease) -> Result<HostCallProxy, napi_uniffi_engine::BridgeErrorDescriptor> {{
     let method = host.get_named_property::<Function<'static, u32, ()>>("recordHostCall").map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?;
     let call = method.build_threadsafe_function().callee_handled::<false>().build_callback(|context| Ok(context.value)).map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?;
     Ok(HostCallProxy {{ inner: Arc::new(HostCallProxyInner {{ id: callback_id, call, _lease: lease }}) }})
   }}
-  pub fn build_two_host_call_proxy(host: &Object<'static>, _callback_type_id: u32, callback_id: u32, _contract: napi_uniffi_engine::SessionCallbackArgument, lease: napi_uniffi_engine::SessionCallbackLease) -> Result<TwoHostCallProxy, napi_uniffi_engine::BridgeErrorDescriptor> {{
+  pub fn build_two_host_call_proxy(host: &Object<'static>, _callback_type_id: u32, callback_id: u32, _contract: napi_uniffi_engine::SessionCallbackArgument, _invoker: napi_uniffi_engine::SessionCallbackInvoker, lease: napi_uniffi_engine::SessionCallbackLease) -> Result<TwoHostCallProxy, napi_uniffi_engine::BridgeErrorDescriptor> {{
     // Accessing the same property twice creates two method wrappers on one
     // invocation Proxy.  The first TSFN is dropped while the second remains
     // live so an early method finalizer cannot invalidate its host target.
@@ -2471,8 +2528,8 @@ mod fixture {{
     let second = second_method.build_threadsafe_function().callee_handled::<false>().build_callback(|context| Ok(context.value)).map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?;
     Ok(TwoHostCallProxy {{ inner: Arc::new(TwoHostCallProxyInner {{ id: callback_id, first: Mutex::new(Some(first)), second: Mutex::new(Some(second)), _lease: lease }}) }})
   }}
-  pub fn build_reentrant_proxy(host: &Object<'static>, callback_type_id: u32, callback_id: u32, contract: napi_uniffi_engine::SessionCallbackArgument, lease: napi_uniffi_engine::SessionCallbackLease) -> Result<HostCallProxy, napi_uniffi_engine::BridgeErrorDescriptor> {{
-    let proxy = build_host_call_proxy(host, callback_type_id, callback_id, contract, lease)?;
+  pub fn build_reentrant_proxy(host: &Object<'static>, callback_type_id: u32, callback_id: u32, contract: napi_uniffi_engine::SessionCallbackArgument, invoker: napi_uniffi_engine::SessionCallbackInvoker, lease: napi_uniffi_engine::SessionCallbackLease) -> Result<HostCallProxy, napi_uniffi_engine::BridgeErrorDescriptor> {{
+    let proxy = build_host_call_proxy(host, callback_type_id, callback_id, contract, invoker, lease)?;
     let close = host.get_named_property::<Function<'static, (), ()>>("reenterClose").map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?;
     close.call(()).map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::backend(error.to_string()))?;
     Ok(proxy)
@@ -3188,6 +3245,18 @@ const assertOneTeardownTimer = (before, label) => {
   deadlineOutputController.invokeSync(24, []);
   await deadlineCancel;
   await deadlineOutputController.close();
+
+  // Scoped callback proxies receive the same session-owned invoker as
+  // retained proxies but never acquire a callback lease. Two proxy instances
+  // in one session must therefore consume one shared invocation-ID domain.
+  const scopedSession = addon.__uniffi_backend_factory(host);
+  const scopedCallsBefore = callbackCalls.length;
+  assert.equal((await scopedSession.invokeAsync(54, [40])).value, 7);
+  assert.equal((await scopedSession.invokeAsync(54, [41])).value, 7);
+  const scopedCalls = callbackCalls.slice(scopedCallsBefore);
+  assert.deepEqual(scopedCalls.map((call) => call[2]), [40, 41]);
+  assert.deepEqual(scopedCalls.map((call) => call[4]), [0, 1]);
+  await scopedSession.close();
 
   let droppedSession = addon.__uniffi_backend_factory(host);
   const droppedOutput = droppedSession.invokeAsync(9, []);

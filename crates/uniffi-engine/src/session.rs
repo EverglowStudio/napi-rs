@@ -26,6 +26,10 @@ struct LifecycleGate {
   env: sys::napi_env,
   state: AtomicPtr<SessionState>,
   detached: AtomicBool,
+  /// Callback proxies may outlive the public session object.  Keep a
+  /// dedicated gate for invocation capabilities so `close()` can revoke new
+  /// callback entries immediately, before the final state teardown happens.
+  invocations_open: AtomicBool,
   active_settlements: AtomicU32,
   close_deferred: AtomicPtr<sys::napi_deferred__>,
   settlement_refs: Mutex<Vec<Arc<PendingSessionRef>>>,
@@ -73,6 +77,7 @@ impl LifecycleGate {
       env,
       state: AtomicPtr::new(ptr::null_mut()),
       detached: AtomicBool::new(false),
+      invocations_open: AtomicBool::new(true),
       active_settlements: AtomicU32::new(0),
       close_deferred: AtomicPtr::new(ptr::null_mut()),
       settlement_refs: Mutex::new(Vec::new()),
@@ -225,12 +230,21 @@ impl LifecycleGate {
   /// released.  The returned pointer is used only by the current JS-thread
   /// teardown path; settlement contexts never dereference it after this call.
   fn detach(&self) -> *mut SessionState {
+    self.invalidate_invocations();
     self.detached.store(true, Ordering::Release);
     self.detach_host_leases();
     let state = self.state.swap(ptr::null_mut(), Ordering::AcqRel);
     self.detach_settlement_refs();
     self.resolve_close();
     state
+  }
+
+  fn invalidate_invocations(&self) {
+    self.invocations_open.store(false, Ordering::Release);
+  }
+
+  fn invocations_are_open(&self) -> bool {
+    self.invocations_open.load(Ordering::Acquire) && !self.detached.load(Ordering::Acquire)
   }
 }
 
@@ -263,6 +277,84 @@ pub enum SessionCallbackThreading {
 pub enum SessionCallbackReentrancy {
   Allowed,
   Forbidden,
+}
+
+/// Session-owned capability used by every generated callback proxy.
+///
+/// The capability is intentionally independent of `SessionCallbackLease`:
+/// scoped callbacks need to invoke the Host without acquiring a retained
+/// callback lease, while retained callbacks carry both this invoker and their
+/// lease.  Clones share one monotonic allocator and one lifecycle gate, so
+/// invocation IDs cannot overlap between proxies in a session and callbacks
+/// cannot start after close/deadline revocation.
+#[derive(Clone)]
+pub struct SessionCallbackInvoker {
+  inner: Arc<CallbackInvokerInner>,
+}
+
+struct CallbackInvokerInner {
+  next_invocation_id: AtomicU32,
+  gate: Arc<LifecycleGate>,
+}
+
+impl SessionCallbackInvoker {
+  fn new(gate: Arc<LifecycleGate>) -> Self {
+    Self {
+      inner: Arc::new(CallbackInvokerInner {
+        next_invocation_id: AtomicU32::new(0),
+        gate,
+      }),
+    }
+  }
+
+  /// Allocate a session-local asynchronous callback invocation ID.
+  ///
+  /// The lifecycle check is performed both before and after the atomic
+  /// allocation.  A close/deadline racing an in-flight allocation therefore
+  /// either revokes it before return or lets the already-started invocation
+  /// finish; calls made after revocation always fail before entering Host.
+  pub fn next_invocation_id(&self) -> Result<u32> {
+    if !self.inner.gate.invocations_are_open() {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "UniFFI callback invoker is closed",
+      ));
+    }
+    loop {
+      let invocation_id = self.inner.next_invocation_id.load(Ordering::Acquire);
+      let successor = invocation_id.checked_add(1).ok_or_else(|| {
+        Error::new(
+          Status::GenericFailure,
+          "callback invocation ID space exhausted",
+        )
+      })?;
+      if self
+        .inner
+        .next_invocation_id
+        .compare_exchange(
+          invocation_id,
+          successor,
+          Ordering::AcqRel,
+          Ordering::Acquire,
+        )
+        .is_ok()
+      {
+        if self.inner.gate.invocations_are_open() {
+          return Ok(invocation_id);
+        }
+        return Err(Error::new(
+          Status::GenericFailure,
+          "UniFFI callback invoker is closed",
+        ));
+      }
+      if !self.inner.gate.invocations_are_open() {
+        return Err(Error::new(
+          Status::GenericFailure,
+          "UniFFI callback invoker is closed",
+        ));
+      }
+    }
+  }
 }
 
 /// An explicit retained callback transfer.  Generated callback proxies own a
@@ -478,13 +570,26 @@ impl Drop for CallbackLeaseInner {
 #[derive(Clone)]
 pub struct SessionCallbackTransfers {
   use_sites: Arc<Vec<Vec<SessionCallbackLease>>>,
+  invoker: Option<SessionCallbackInvoker>,
 }
 
 impl SessionCallbackTransfers {
   pub fn empty() -> Self {
     Self {
       use_sites: Arc::new(Vec::new()),
+      invoker: None,
     }
+  }
+
+  /// Resolve the engine-owned callback invocation capability associated with
+  /// this native operation's transfer carrier.
+  pub fn invoker(&self) -> Result<SessionCallbackInvoker> {
+    self.invoker.clone().ok_or_else(|| {
+      Error::new(
+        Status::InvalidArg,
+        "callback invocation capability is unavailable",
+      )
+    })
   }
 
   pub fn lease(&self, use_site_index: usize, value_index: usize) -> Result<SessionCallbackLease> {
@@ -743,7 +848,7 @@ struct SessionState {
   operations: Vec<SessionOperation>,
   closing: Cell<bool>,
   closed: Cell<bool>,
-  next_invocation_id: Cell<u32>,
+  callback_invoker: SessionCallbackInvoker,
   pending_work: Cell<u32>,
   close_deferred: Cell<sys::napi_deferred>,
   close_promise: Cell<sys::napi_ref>,
@@ -1197,6 +1302,7 @@ impl SessionState {
         transfer_id,
         SessionCallbackTransfers {
           use_sites: Arc::new(use_site_leases),
+          invoker: Some(self.callback_invoker.clone()),
         },
       );
       self.callback_transfers.borrow_mut().push(transfer_id);
@@ -2173,7 +2279,9 @@ impl SessionState {
             args[0] = named_property(self.env, args[0], "handle")?;
           }
           let mut native_args = Vec::with_capacity(
-            args.len() + usize::from(operation.native_call == SessionNativeCall::HostAndArguments),
+            args.len()
+              + usize::from(operation.native_call == SessionNativeCall::HostAndArguments)
+              + usize::from(operation.callback_transfer) * 2,
           );
           if operation.native_call == SessionNativeCall::HostAndArguments {
             let lease = self.gate.new_host_lease(self.session_generation);
@@ -2299,7 +2407,7 @@ impl SessionState {
       js_u32(self.env, method_id)?,
     ];
     let method = if asynchronous {
-      let invocation_id = Self::allocate_invocation_id(&self.next_invocation_id)?;
+      let invocation_id = self.callback_invoker.next_invocation_id()?;
       host_args.push(js_u32(self.env, invocation_id)?);
       "invokeCallbackAsync"
     } else {
@@ -2309,25 +2417,11 @@ impl SessionState {
     self.call_host(method, &host_args)
   }
 
-  /// Allocate a session-local callback invocation ID without ever reusing one.
-  /// Once the `u32` namespace is exhausted the session remains exhausted and
-  /// the caller gets a protocol error before any host hook is entered.
-  fn allocate_invocation_id(next: &Cell<u32>) -> Result<u32> {
-    let invocation_id = next.get();
-    let successor = invocation_id.checked_add(1).ok_or_else(|| {
-      Error::new(
-        Status::GenericFailure,
-        "callback invocation ID space exhausted",
-      )
-    })?;
-    next.set(successor);
-    Ok(invocation_id)
-  }
-
   fn close(&self, session_value: sys::napi_value) {
     if self.closing.replace(true) {
       return;
     }
+    self.gate.invalidate_invocations();
     let callbacks = std::mem::take(&mut *self.callback_leases.borrow_mut());
     for callback in callbacks {
       if let Some(callback) = callback.upgrade() {
@@ -2768,7 +2862,7 @@ pub fn create_backend_session(
     closed: Cell::new(false),
     close_policy,
     deadline_timer: Cell::new(ptr::null_mut()),
-    next_invocation_id: Cell::new(0),
+    callback_invoker: SessionCallbackInvoker::new(gate.clone()),
     pending_work: Cell::new(0),
     close_deferred: Cell::new(ptr::null_mut()),
     close_promise: Cell::new(ptr::null_mut()),
@@ -4651,4 +4745,21 @@ fn callback_result(
 fn clear_pending_exception(env: sys::napi_env) {
   let mut exception = ptr::null_mut();
   let _ = unsafe { sys::napi_get_and_clear_last_exception(env, &mut exception) };
+}
+
+#[cfg(test)]
+mod callback_invoker_tests {
+  use super::*;
+
+  #[test]
+  fn clones_share_allocator_and_close_revokes_new_calls() {
+    let gate = LifecycleGate::new(ptr::null_mut());
+    let first = SessionCallbackInvoker::new(gate.clone());
+    let second = first.clone();
+    assert_eq!(first.next_invocation_id().unwrap(), 0);
+    assert_eq!(second.next_invocation_id().unwrap(), 1);
+    gate.invalidate_invocations();
+    assert!(first.next_invocation_id().is_err());
+    assert!(second.next_invocation_id().is_err());
+  }
 }
