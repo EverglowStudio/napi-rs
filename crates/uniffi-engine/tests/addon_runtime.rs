@@ -6,8 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use napi_family_core::{
   AsyncKind, CallbackContract, CallbackReentrancy, CallbackRetention, CallbackThreading,
   CallbackUseSite, ClosePolicy, DeadlineAction, FamilyOperationInput, FamilyPlan, FamilyPlanInput,
-  HostFlavor, OperationDispatch, OperationKind, ResourceBinding, ResourceKind, ResourceOwnership,
-  StreamDirection, StreamSlotIdentity, StreamUseSite, StreamValueBinding, ValuePath,
+  HostFlavor, OperationDispatch, OperationKind, ReceiverBinding, ResourceBinding, ResourceKind,
+  ResourceOwnership, StreamDirection, StreamSlotIdentity, StreamUseSite, StreamValueBinding,
+  ValuePath,
 };
 use napi_uniffi_engine::{
   generate_napi_module, ArgumentBinding, ErrorBinding, ReturnBinding, RustArgumentPlan,
@@ -381,10 +382,10 @@ fn family() -> FamilyPlan {
       fallible: false,
       argument_count: 0,
       dispatch: OperationDispatch::Native,
-      receiver: Some(ResourceBinding {
+      receiver: Some(ReceiverBinding::Resource(ResourceBinding {
         kind: ResourceKind::OutputStream,
         ownership: ResourceOwnership::Borrowed,
-      }),
+      })),
       result: None,
       callbacks: Vec::new(),
       streams: Vec::new(),
@@ -401,10 +402,10 @@ fn family() -> FamilyPlan {
       fallible: false,
       argument_count: 0,
       dispatch: OperationDispatch::Native,
-      receiver: Some(ResourceBinding {
+      receiver: Some(ReceiverBinding::Resource(ResourceBinding {
         kind: ResourceKind::OutputStream,
         ownership: ResourceOwnership::Borrowed,
-      }),
+      })),
       result: None,
       callbacks: Vec::new(),
       streams: Vec::new(),
@@ -501,10 +502,10 @@ fn family() -> FamilyPlan {
       fallible: false,
       argument_count: 0,
       dispatch: OperationDispatch::Native,
-      receiver: Some(ResourceBinding {
+      receiver: Some(ReceiverBinding::Resource(ResourceBinding {
         kind: ResourceKind::OutputStream,
         ownership: ResourceOwnership::Borrowed,
-      }),
+      })),
       result: None,
       callbacks: Vec::new(),
       streams: Vec::new(),
@@ -521,10 +522,10 @@ fn family() -> FamilyPlan {
       fallible: false,
       argument_count: 0,
       dispatch: OperationDispatch::Native,
-      receiver: Some(ResourceBinding {
+      receiver: Some(ReceiverBinding::Resource(ResourceBinding {
         kind: ResourceKind::OutputStream,
         ownership: ResourceOwnership::Borrowed,
-      }),
+      })),
       result: None,
       callbacks: Vec::new(),
       streams: Vec::new(),
@@ -541,10 +542,10 @@ fn family() -> FamilyPlan {
       fallible: false,
       argument_count: 0,
       dispatch: OperationDispatch::InputStreamHostPull,
-      receiver: Some(ResourceBinding {
+      receiver: Some(ReceiverBinding::Resource(ResourceBinding {
         kind: ResourceKind::InputStream,
         ownership: ResourceOwnership::Borrowed,
-      }),
+      })),
       result: None,
       callbacks: Vec::new(),
       streams: Vec::new(),
@@ -561,10 +562,10 @@ fn family() -> FamilyPlan {
       fallible: false,
       argument_count: 0,
       dispatch: OperationDispatch::InputStreamHostCancel,
-      receiver: Some(ResourceBinding {
+      receiver: Some(ReceiverBinding::Resource(ResourceBinding {
         kind: ResourceKind::InputStream,
         ownership: ResourceOwnership::Borrowed,
-      }),
+      })),
       result: None,
       callbacks: Vec::new(),
       streams: Vec::new(),
@@ -1025,15 +1026,54 @@ fn family() -> FamilyPlan {
       streams: Vec::new(),
       stream_slot: None,
     },
+    FamilyOperationInput {
+      id: 45,
+      kind: OperationKind::Method,
+      async_kind: AsyncKind::Sync,
+      fallible: false,
+      argument_count: 0,
+      dispatch: OperationDispatch::Native,
+      receiver: Some(ReceiverBinding::Value),
+      result: None,
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 46,
+      kind: OperationKind::Method,
+      async_kind: AsyncKind::Sync,
+      fallible: false,
+      argument_count: 0,
+      dispatch: OperationDispatch::Native,
+      receiver: Some(ReceiverBinding::Value),
+      result: None,
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 47,
+      kind: OperationKind::Method,
+      async_kind: AsyncKind::Async,
+      fallible: false,
+      argument_count: 0,
+      dispatch: OperationDispatch::Native,
+      receiver: Some(ReceiverBinding::Value),
+      result: None,
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
   ]);
-  operations[5].receiver = Some(ResourceBinding {
+  operations[5].receiver = Some(ReceiverBinding::Resource(ResourceBinding {
     kind: ResourceKind::InputStream,
     ownership: ResourceOwnership::Borrowed,
-  });
-  operations[6].receiver = Some(ResourceBinding {
+  }));
+  operations[6].receiver = Some(ReceiverBinding::Resource(ResourceBinding {
     kind: ResourceKind::InputStream,
     ownership: ResourceOwnership::Borrowed,
-  });
+  }));
   operations[5].stream_slot = Some(StreamSlotIdentity {
     use_site_id: 0,
     operation_id: 5,
@@ -1668,6 +1708,60 @@ fn plan(family: &FamilyPlan) -> RustBridgePlan {
       },
       error_binding: ErrorBinding::Infallible,
     },
+    RustOperationPlan {
+      operation_id: id(45),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::record_value_method),
+      },
+      receiver: Some(napi_uniffi_engine::RustReceiverPlan {
+        name: Ident::new("record", Span::call_site()),
+        binding: ArgumentBinding::LowerWith {
+          carrier_type: syn::parse_quote!(napi::bindgen_prelude::Object<'static>),
+          lower: syn::parse_quote!(fixture::lower_record_value),
+        },
+      }),
+      arguments: Vec::new(),
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(46),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::enum_value_method),
+      },
+      receiver: Some(napi_uniffi_engine::RustReceiverPlan {
+        name: Ident::new("value", Span::call_site()),
+        binding: ArgumentBinding::LowerWith {
+          carrier_type: syn::parse_quote!(napi::bindgen_prelude::Object<'static>),
+          lower: syn::parse_quote!(fixture::lower_enum_value),
+        },
+      }),
+      arguments: Vec::new(),
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(47),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::async_record_value_method),
+      },
+      receiver: Some(napi_uniffi_engine::RustReceiverPlan {
+        name: Ident::new("record", Span::call_site()),
+        binding: ArgumentBinding::LowerWith {
+          carrier_type: syn::parse_quote!(napi::bindgen_prelude::Object<'static>),
+          lower: syn::parse_quote!(fixture::lower_record_value),
+        },
+      }),
+      arguments: Vec::new(),
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
   ];
   RustBridgePlan::build_with_resource_hooks(
     family,
@@ -1819,8 +1913,27 @@ mod fixture {{
   struct TwoHostCallProxyInner {{ id: u32, first: Mutex<Option<ThreadsafeFunction<u32, (), u32, napi::Status, false>>>, second: Mutex<Option<ThreadsafeFunction<u32, (), u32, napi::Status, false>>>, _lease: napi_uniffi_engine::SessionCallbackLease }}
   pub struct TwoHostCallProxy {{ inner: Arc<TwoHostCallProxyInner> }}
 
+  pub struct RecordValue {{ amount: u32 }}
+  pub enum EnumValue {{ Ready(u32), Other }}
+
   pub fn answer() -> i64 {{ 42 }}
   pub async fn plus_one(value: i64) -> i64 {{ value + 1 }}
+  pub fn lower_record_value(value: Object<'static>) -> Result<RecordValue, napi_uniffi_engine::BridgeErrorDescriptor> {{
+    let amount = value.get_named_property::<u32>("amount").map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?;
+    Ok(RecordValue {{ amount }})
+  }}
+  pub fn record_value_method(value: RecordValue) -> u32 {{ value.amount + 1 }}
+  pub async fn async_record_value_method(value: RecordValue) -> u32 {{ value.amount + 3 }}
+  pub fn lower_enum_value(value: Object<'static>) -> Result<EnumValue, napi_uniffi_engine::BridgeErrorDescriptor> {{
+    let tag = value.get_named_property::<String>("tag").map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?;
+    if tag == "Ready" {{
+      let amount = value.get_named_property::<u32>("amount").map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?;
+      Ok(EnumValue::Ready(amount))
+    }} else {{
+      Ok(EnumValue::Other)
+    }}
+  }}
+  pub fn enum_value_method(value: EnumValue) -> u32 {{ match value {{ EnumValue::Ready(amount) => amount + 2, EnumValue::Other => 0 }} }}
   pub fn build_callback_proxy(_host: &napi::bindgen_prelude::Object<'static>, callback_type_id: u32, callback_id: u32, contract: napi_uniffi_engine::SessionCallbackArgument, lease: napi_uniffi_engine::SessionCallbackLease) -> Result<CallbackProxy, napi_uniffi_engine::BridgeErrorDescriptor> {{
     assert_eq!(callback_type_id, 0); assert_eq!(contract.callback_type_id, 0); assert_eq!(contract.retention, napi_uniffi_engine::SessionCallbackRetention::Retained); assert_eq!(contract.threading, napi_uniffi_engine::SessionCallbackThreading::MayCrossThread); assert_eq!(contract.reentrancy, napi_uniffi_engine::SessionCallbackReentrancy::Allowed); Ok(CallbackProxy {{ id: callback_id, lease }})
   }}
@@ -2087,6 +2200,14 @@ const assertOneTeardownTimer = (before, label) => {
   assert.equal(session.invokeSync(0, []).kind, 'value');
   assert.equal(session.invokeSync(0, []).value, 42n);
   assert.equal((await session.invokeAsync(1, [41n])).value, 42n);
+  const valueReceiverObjectReleasesBefore = session.invokeSync(39, [9999]).value;
+  const valueReceiverObjectReleases = releasedCallbacks.slice();
+  const valueReceiverStreamReleases = releasedStreams.slice();
+  assert.equal(session.invokeSync(45, [{ amount: 9, handle: 9999 }]).value, 10);
+  assert.equal(session.invokeSync(46, [{ tag: 'Ready', amount: 7, handle: 9999 }]).value, 9);
+  assert.equal((await session.invokeAsync(47, [{ amount: 6, handle: 9999 }])).value, 9);
+  assert.deepEqual(releasedCallbacks, valueReceiverObjectReleases);
+  assert.deepEqual(releasedStreams, valueReceiverStreamReleases);
   session.invokeSync(17, [3]);
   await session.invokeAsync(18, [3]);
   session.invokeSync(19, [3]);
@@ -2396,6 +2517,9 @@ const assertOneTeardownTimer = (before, label) => {
   const pending = session.invokeAsync(9, []);
   await session.close();
   await pending;
+  const valueReceiverResourceQuery = addon.__uniffi_backend_factory(host);
+  assert.equal(valueReceiverResourceQuery.invokeSync(39, [9999]).value, valueReceiverObjectReleasesBefore);
+  await valueReceiverResourceQuery.close();
   assert.equal(retained.length, 0);
   const drainingSession = addon.__uniffi_backend_factory(host);
   const drainingPull = drainingSession.invokeAsync(5, [44]);

@@ -18,7 +18,7 @@ use napi_family_core::StreamDirection;
 use napi_family_core::{
   AsyncKind, BigIntWords, CallbackReentrancy, CallbackRetention, CallbackThreading,
   CallbackUseSite, FamilyOperation, FamilyOperationTarget, FamilyPlan, FamilyPlanError, HostFlavor,
-  OperationKind, ResourceKind, ResourceOwnership, ValuePath, ValuePathSegment,
+  OperationKind, ReceiverBinding, ResourceKind, ResourceOwnership, ValuePath, ValuePathSegment,
 };
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
@@ -31,7 +31,7 @@ pub use session::{
   create_backend_session, take_session_callback_transfers, SessionCallbackArgument,
   SessionCallbackLease, SessionCallbackReentrancy, SessionCallbackRetention,
   SessionCallbackThreading, SessionCallbackTransfers, SessionNativeCall,
-  SessionOperationDescriptor, SessionOperationDispatch, SessionResourceCallbacks,
+  SessionOperationDescriptor, SessionOperationDispatch, SessionReceiver, SessionResourceCallbacks,
   SessionResourceReceiver, SessionStreamArgument, SessionStreamDirection, SessionValuePathSegment,
 };
 
@@ -467,18 +467,16 @@ fn validate_resource_hooks(
   hooks: &RustResourceHooks,
 ) -> Result<(), EngineError> {
   let needs_object = family.operations().iter().any(|operation| {
-    operation
-      .receiver
-      .as_ref()
-      .is_some_and(|receiver| receiver.kind == ResourceKind::Object)
-      || operation.result.map(|resource| resource.kind) == Some(ResourceKind::Object)
+    matches!(
+      operation.receiver,
+      Some(ReceiverBinding::Resource(resource)) if resource.kind == ResourceKind::Object
+    ) || operation.result.map(|resource| resource.kind) == Some(ResourceKind::Object)
   });
   let needs_output = family.operations().iter().any(|operation| {
-    operation
-      .receiver
-      .as_ref()
-      .is_some_and(|receiver| receiver.kind == ResourceKind::OutputStream)
-      || operation.result.map(|resource| resource.kind) == Some(ResourceKind::OutputStream)
+    matches!(
+      operation.receiver,
+      Some(ReceiverBinding::Resource(resource)) if resource.kind == ResourceKind::OutputStream
+    ) || operation.result.map(|resource| resource.kind) == Some(ResourceKind::OutputStream)
       || operation
         .streams
         .iter()
@@ -628,7 +626,24 @@ fn validate_receiver(
 ) -> Result<(), EngineError> {
   match (&family_operation.receiver, &operation.receiver) {
     (None, None) => Ok(()),
-    (Some(expected), Some(actual)) => {
+    (Some(ReceiverBinding::Value), Some(actual)) => {
+      let valid = matches!(
+        &actual.binding,
+        ArgumentBinding::Direct { .. }
+          | ArgumentBinding::I64BigInt
+          | ArgumentBinding::U64BigInt
+          | ArgumentBinding::LowerWith { .. }
+          | ArgumentBinding::LowerWithHost { .. }
+      );
+      if valid {
+        Ok(())
+      } else {
+        Err(EngineError::InvalidValueReceiver {
+          operation_id: operation.operation_id,
+        })
+      }
+    }
+    (Some(ReceiverBinding::Resource(expected)), Some(actual)) => {
       let valid = match (expected.kind, &actual.binding) {
         (ResourceKind::Object, ArgumentBinding::ObjectLease { ownership, .. })
         | (ResourceKind::OutputStream, ArgumentBinding::OutputStreamLease { ownership, .. }) => {
@@ -640,15 +655,15 @@ fn validate_receiver(
       if valid {
         Ok(())
       } else {
-        Err(EngineError::InvalidObjectReceiver {
+        Err(EngineError::InvalidResourceReceiver {
           operation_id: operation.operation_id,
         })
       }
     }
-    (Some(_), None) => Err(EngineError::MissingObjectReceiver {
+    (Some(_), None) => Err(EngineError::MissingReceiver {
       operation_id: operation.operation_id,
     }),
-    (None, Some(_)) => Err(EngineError::UnexpectedObjectReceiver {
+    (None, Some(_)) => Err(EngineError::UnexpectedReceiver {
       operation_id: operation.operation_id,
     }),
   }
@@ -747,6 +762,7 @@ pub fn generate_napi_module(
     family.flavor(),
     family.close_policy(),
     family,
+    rust.operations(),
     &callbacks,
     &resource_callbacks,
   )?;
@@ -770,6 +786,53 @@ struct GeneratedOperation {
   function: NapiFn,
 }
 
+fn operation_requires_host(operation: &RustOperationPlan, family: &FamilyOperation) -> bool {
+  let has_argument_callbacks = family.callbacks.iter().any(|use_site| {
+    matches!(
+      use_site.path.segments().first(),
+      Some(ValuePathSegment::Argument(_))
+    )
+  });
+  has_argument_callbacks
+    || family
+      .streams
+      .iter()
+      .any(|use_site| use_site.direction == StreamDirection::Input)
+    || operation.arguments.iter().any(|argument| {
+      matches!(
+        argument.binding,
+        ArgumentBinding::CallbackProxy { .. }
+          | ArgumentBinding::InputStreamProxy { .. }
+          | ArgumentBinding::LowerWithHost { .. }
+      )
+    })
+    || operation
+      .receiver
+      .as_ref()
+      .is_some_and(|receiver| matches!(&receiver.binding, ArgumentBinding::LowerWithHost { .. }))
+}
+
+fn value_receiver_requires_sync_lower(
+  operation: &RustOperationPlan,
+  family: &FamilyOperation,
+) -> bool {
+  if !matches!(family.receiver, Some(ReceiverBinding::Value)) {
+    return false;
+  }
+  matches!(
+    operation
+      .receiver
+      .as_ref()
+      .map(|receiver| &receiver.binding),
+    Some(
+      ArgumentBinding::I64BigInt
+        | ArgumentBinding::U64BigInt
+        | ArgumentBinding::LowerWith { .. }
+        | ArgumentBinding::LowerWithHost { .. }
+    )
+  )
+}
+
 fn generate_operation(
   operation: &RustOperationPlan,
   family: &FamilyOperation,
@@ -790,25 +853,17 @@ fn generate_operation(
     )
   });
   let callback_transfer = has_argument_callbacks;
-  let requires_host = has_argument_callbacks
-    || family
-      .streams
-      .iter()
-      .any(|use_site| use_site.direction == StreamDirection::Input)
-    || operation.arguments.iter().any(|argument| {
-      matches!(
-        argument.binding,
-        ArgumentBinding::CallbackProxy { .. }
-          | ArgumentBinding::InputStreamProxy { .. }
-          | ArgumentBinding::LowerWithHost { .. }
-      )
-    });
+  let requires_host = operation_requires_host(operation, family);
   // A Host proxy is a per-invocation JS object and is therefore not `Send`.
   // For async HostAndArguments operations, lower the Host synchronously in the
   // N-API entry point and only move the resulting native proxy/carriers into
   // the worker future.  Keeping this special case in the engine frontend
   // avoids teaching the generic backend about this engine-owned protocol.
-  let manual_async_host = requires_host && async_kind == AsyncKind::Async;
+  // Any value receiver conversion that touches an N-API carrier must happen
+  // before an async future is spawned.  This keeps raw N-API values out of
+  // the worker future even when no Host proxy is otherwise required.
+  let manual_async_entry = async_kind == AsyncKind::Async
+    && (requires_host || value_receiver_requires_sync_lower(operation, family));
   let mut function_builder = NapiFnBuilder::new(function_name.clone(), function_name.to_string());
   if requires_host {
     function_builder = function_builder.argument(NapiFnArg {
@@ -818,7 +873,7 @@ fn generate_operation(
       ts_arg_type: None,
     });
   }
-  if manual_async_host {
+  if manual_async_entry {
     // `Env` is injected by the backend and is not a JavaScript argument.  It
     // lets the synchronous entry create a Promise before its Host object is
     // dropped, while no raw N-API value is captured by the worker future.
@@ -835,7 +890,7 @@ fn generate_operation(
       });
     }
   }
-  function_builder = if manual_async_host {
+  function_builder = if manual_async_entry {
     function_builder
       .result_return_type(syn::parse_quote!(napi::bindgen_prelude::sys::napi_value))
       .asynchronous(false)
@@ -853,7 +908,7 @@ fn generate_operation(
   let mut argument_names = Vec::with_capacity(operation.arguments.len());
   let mut lowerings = Vec::new();
   let lower_error = |error: TokenStream| {
-    if manual_async_host {
+    if manual_async_entry {
       quote! {
         {
           let __uniffi_error_promise = napi::bindgen_prelude::PromiseRaw::<
@@ -878,22 +933,73 @@ fn generate_operation(
       ts_arg_type: None,
     });
     argument_names.push(name.clone());
-    let lower = match &receiver.binding {
+    match &receiver.binding {
+      ArgumentBinding::Direct { .. } => {}
+      ArgumentBinding::I64BigInt => {
+        let error = lower_error(quote!(
+          napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string())
+        ));
+        lowerings.push(quote! {
+          let (__uniffi_value, __uniffi_lossless) = #name.get_i64();
+          let #name = match napi_uniffi_engine::napi_family_core::require_lossless_i64(
+            __uniffi_value,
+            __uniffi_lossless,
+          ) {
+            Ok(value) => value,
+            Err(error) => #error,
+          };
+        });
+      }
+      ArgumentBinding::U64BigInt => {
+        let error = lower_error(quote!(
+          napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string())
+        ));
+        lowerings.push(quote! {
+          let (__uniffi_negative, __uniffi_value, __uniffi_lossless) = #name.get_u64();
+          let #name = match napi_uniffi_engine::napi_family_core::require_lossless_u64(
+            __uniffi_negative,
+            __uniffi_value,
+            __uniffi_lossless,
+          ) {
+            Ok(value) => value,
+            Err(error) => #error,
+          };
+        });
+      }
+      ArgumentBinding::LowerWith { lower, .. } => {
+        let error = lower_error(quote!(error));
+        lowerings.push(quote! {
+          let #name = match #lower(#name) {
+            Ok(value) => value,
+            Err(error) => #error,
+          };
+        });
+      }
+      ArgumentBinding::LowerWithHost { lower, .. } => {
+        let error = lower_error(quote!(error));
+        lowerings.push(quote! {
+          let #name = match #lower(&__uniffi_host, #name, &__uniffi_callback_transfers) {
+            Ok(value) => value,
+            Err(error) => #error,
+          };
+        });
+      }
       ArgumentBinding::ObjectLease { lower, .. }
-      | ArgumentBinding::OutputStreamLease { lower, .. } => lower,
-      _ => {
-        return Err(EngineError::InvalidObjectReceiver {
+      | ArgumentBinding::OutputStreamLease { lower, .. } => {
+        let error = lower_error(quote!(error));
+        lowerings.push(quote! {
+          let #name = match #lower(#name) {
+            Ok(value) => value,
+            Err(error) => #error,
+          };
+        });
+      }
+      ArgumentBinding::CallbackProxy { .. } | ArgumentBinding::InputStreamProxy { .. } => {
+        return Err(EngineError::InvalidResourceReceiver {
           operation_id: operation.operation_id,
         });
       }
-    };
-    let error = lower_error(quote!(error));
-    lowerings.push(quote! {
-      let #name = match #lower(#name) {
-        Ok(value) => value,
-        Err(error) => #error
-      };
-    });
+    }
   }
   for (argument_index, argument) in operation.arguments.iter().enumerate() {
     let name = &argument.name;
@@ -1146,8 +1252,8 @@ fn generate_operation(
     }
   };
   let return_carrier = operation.return_binding.carrier_type();
-  let env_declaration = manual_async_host.then(|| quote!(__uniffi_env: &napi::Env,));
-  let body = if manual_async_host {
+  let env_declaration = manual_async_entry.then(|| quote!(__uniffi_env: &napi::Env,));
+  let body = if manual_async_entry {
     quote! {
       #[doc(hidden)]
       fn #function_name(
@@ -1314,6 +1420,7 @@ fn generate_factory(
   flavor: HostFlavor,
   close_policy: ClosePolicy,
   family: &FamilyPlan,
+  rust_operations: &[RustOperationPlan],
   callbacks: &[Option<Ident>],
   resource_callbacks: &GeneratedResourceCallbacks,
 ) -> Result<GeneratedFactory, EngineError> {
@@ -1346,8 +1453,11 @@ fn generate_factory(
   let descriptors = family
     .operations()
     .iter()
+    .zip(rust_operations)
     .zip(callbacks)
-    .map(|(operation, callback)| session_descriptor(operation, callback.as_ref()))
+    .map(|((operation, rust_operation), callback)| {
+      session_descriptor(operation, rust_operation, callback.as_ref())
+    })
     .collect::<Result<Vec<_>, _>>()?;
   let release_object = optional_callback_factory(resource_callbacks.release_object.as_ref());
   let cancel_output_stream =
@@ -1389,6 +1499,7 @@ fn optional_callback_factory(callback: Option<&Ident>) -> TokenStream {
 
 fn session_descriptor(
   operation: &FamilyOperation,
+  rust_operation: &RustOperationPlan,
   callback: Option<&Ident>,
 ) -> Result<TokenStream, EngineError> {
   let operation_id = operation.id;
@@ -1447,27 +1558,19 @@ fn session_descriptor(
   };
   let receiver = match operation.receiver {
     None => quote!(None),
-    Some(_)
-      if matches!(
-        operation.kind,
-        OperationKind::InputStreamPull | OperationKind::InputStreamCancel
-      ) =>
-    {
-      quote!(Some(
-        napi_uniffi_engine::SessionResourceReceiver::InputStream
-      ))
+    Some(ReceiverBinding::Value) => quote!(Some(napi_uniffi_engine::SessionReceiver::Value)),
+    Some(ReceiverBinding::Resource(resource)) => {
+      let resource = match resource.kind {
+        ResourceKind::Object => quote!(napi_uniffi_engine::SessionResourceReceiver::Object),
+        ResourceKind::InputStream => {
+          quote!(napi_uniffi_engine::SessionResourceReceiver::InputStream)
+        }
+        ResourceKind::OutputStream => {
+          quote!(napi_uniffi_engine::SessionResourceReceiver::OutputStream)
+        }
+      };
+      quote!(Some(napi_uniffi_engine::SessionReceiver::Resource(#resource)))
     }
-    Some(_)
-      if matches!(
-        operation.kind,
-        OperationKind::OutputStreamNext | OperationKind::OutputStreamCancel
-      ) =>
-    {
-      quote! {
-        Some(napi_uniffi_engine::SessionResourceReceiver::OutputStream)
-      }
-    }
-    Some(_) => quote!(Some(napi_uniffi_engine::SessionResourceReceiver::Object)),
   };
   let result = match operation.result.map(|resource| resource.kind) {
     None => quote!(None),
@@ -1485,18 +1588,7 @@ fn session_descriptor(
       ))
     }
   };
-  let has_argument_callbacks = operation.callbacks.iter().any(|use_site| {
-    matches!(
-      use_site.path.segments().first(),
-      Some(ValuePathSegment::Argument(_))
-    )
-  });
-  let native_call = if !has_argument_callbacks
-    && !operation
-      .streams
-      .iter()
-      .any(|use_site| use_site.direction == StreamDirection::Input)
-  {
+  let native_call = if !operation_requires_host(rust_operation, operation) {
     quote!(napi_uniffi_engine::SessionNativeCall::ArgumentsOnly)
   } else {
     quote!(napi_uniffi_engine::SessionNativeCall::HostAndArguments)
@@ -1697,13 +1789,16 @@ pub enum EngineError {
   HostOperationHasStructuredUseSites {
     operation_id: u32,
   },
-  MissingObjectReceiver {
+  MissingReceiver {
     operation_id: u32,
   },
-  UnexpectedObjectReceiver {
+  UnexpectedReceiver {
     operation_id: u32,
   },
-  InvalidObjectReceiver {
+  InvalidValueReceiver {
+    operation_id: u32,
+  },
+  InvalidResourceReceiver {
     operation_id: u32,
   },
   InvalidResourceResult {
@@ -1808,19 +1903,23 @@ impl fmt::Display for EngineError {
         formatter,
         "host operation {operation_id} must not contain callback or stream use-sites"
       ),
-      Self::MissingObjectReceiver { operation_id } => {
+      Self::MissingReceiver { operation_id } => {
         write!(
           formatter,
-          "object operation {operation_id} has no resource receiver"
+          "operation {operation_id} has no Rust receiver binding"
         )
       }
-      Self::UnexpectedObjectReceiver { operation_id } => write!(
+      Self::UnexpectedReceiver { operation_id } => write!(
         formatter,
-        "non-object operation {operation_id} unexpectedly has a resource receiver"
+        "operation {operation_id} unexpectedly has a Rust receiver binding"
       ),
-      Self::InvalidObjectReceiver { operation_id } => write!(
+      Self::InvalidValueReceiver { operation_id } => write!(
         formatter,
-        "object operation {operation_id} requires a borrowed structured object lease receiver"
+        "value receiver operation {operation_id} requires a regular value lowering"
+      ),
+      Self::InvalidResourceReceiver { operation_id } => write!(
+        formatter,
+        "resource receiver operation {operation_id} requires a matching resource lease binding"
       ),
       Self::InvalidResourceResult { operation_id } => write!(
         formatter,

@@ -132,6 +132,16 @@ pub struct ResourceBinding {
   pub ownership: ResourceOwnership,
 }
 
+/// Engine-owned receiver classification.  A method receiver may be an
+/// ordinary value (for example a record or enum value) or an N-API resource
+/// lease.  Keeping the distinction explicit prevents value receivers from
+/// accidentally entering the resource retain/release machinery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReceiverBinding {
+  Value,
+  Resource(ResourceBinding),
+}
+
 /// Dispatch target.  Callback method IDs are supplied by the canonical
 /// frontend; the family planner never derives or persists them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -314,7 +324,7 @@ pub struct FamilyOperationInput {
   pub fallible: bool,
   pub argument_count: usize,
   pub dispatch: OperationDispatch,
-  pub receiver: Option<ResourceBinding>,
+  pub receiver: Option<ReceiverBinding>,
   pub result: Option<ResourceBinding>,
   pub callbacks: Vec<CallbackUseSite>,
   pub streams: Vec<StreamUseSite>,
@@ -328,12 +338,6 @@ pub struct FamilyPlanInput {
   pub flavor: HostFlavor,
   pub close_policy: ClosePolicy,
   pub operations: Vec<FamilyOperationInput>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ObjectReceiver {
-  pub kind: ResourceKind,
-  pub ownership: ResourceOwnership,
 }
 
 /// Runtime entrypoints required by a family plan.
@@ -371,7 +375,7 @@ pub struct FamilyOperation {
   pub async_kind: AsyncKind,
   pub fallible: bool,
   pub argument_count: usize,
-  pub receiver: Option<ObjectReceiver>,
+  pub receiver: Option<ReceiverBinding>,
   pub result: Option<ResourceBinding>,
   pub callbacks: Vec<CallbackUseSite>,
   pub streams: Vec<StreamUseSite>,
@@ -610,10 +614,7 @@ impl FamilyPlan {
           async_kind: operation.async_kind,
           fallible: operation.fallible,
           argument_count: operation.argument_count,
-          receiver: operation.receiver.map(|resource| ObjectReceiver {
-            kind: resource.kind,
-            ownership: resource.ownership,
-          }),
+          receiver: operation.receiver,
           result: operation.result,
           callbacks: operation.callbacks,
           streams: operation.streams,
@@ -670,7 +671,6 @@ fn validate_close_policy(policy: ClosePolicy) -> Result<(), FamilyPlanError> {
 }
 
 fn validate_operation_shape(operation: &FamilyOperationInput) -> Result<(), FamilyPlanError> {
-  let receiver_kind = operation.receiver.map(|resource| resource.kind);
   let required_receiver = matches!(
     operation.kind,
     OperationKind::Method
@@ -679,29 +679,51 @@ fn validate_operation_shape(operation: &FamilyOperationInput) -> Result<(), Fami
       | OperationKind::OutputStreamNext
       | OperationKind::OutputStreamCancel
   );
-  if required_receiver && receiver_kind.is_none() {
+  if required_receiver && operation.receiver.is_none() {
     return Err(FamilyPlanError::MissingReceiver { id: operation.id });
   }
-  if !required_receiver && receiver_kind.is_some() {
+  if !required_receiver && operation.receiver.is_some() {
     return Err(FamilyPlanError::UnexpectedReceiver { id: operation.id });
   }
-  if matches!(operation.kind, OperationKind::Method) && receiver_kind != Some(ResourceKind::Object)
-  {
-    return Err(FamilyPlanError::WrongReceiverKind { id: operation.id });
-  }
-  if matches!(
-    operation.kind,
-    OperationKind::InputStreamPull | OperationKind::InputStreamCancel
-  ) && receiver_kind != Some(ResourceKind::InputStream)
-  {
-    return Err(FamilyPlanError::WrongReceiverKind { id: operation.id });
-  }
-  if matches!(
-    operation.kind,
-    OperationKind::OutputStreamNext | OperationKind::OutputStreamCancel
-  ) && receiver_kind != Some(ResourceKind::OutputStream)
-  {
-    return Err(FamilyPlanError::WrongReceiverKind { id: operation.id });
+  match operation.kind {
+    // Methods can target either a normal value receiver or an object
+    // resource.  The family plan preserves the category verbatim for the
+    // session and Rust bridge; it never infers it from names or operation
+    // IDs.
+    OperationKind::Method => {
+      if matches!(
+        operation.receiver,
+        Some(ReceiverBinding::Resource(ResourceBinding {
+          kind: ResourceKind::InputStream | ResourceKind::OutputStream,
+          ..
+        }))
+      ) {
+        return Err(FamilyPlanError::WrongReceiverKind { id: operation.id });
+      }
+    }
+    OperationKind::InputStreamPull | OperationKind::InputStreamCancel => {
+      if !matches!(
+        operation.receiver,
+        Some(ReceiverBinding::Resource(ResourceBinding {
+          kind: ResourceKind::InputStream,
+          ..
+        }))
+      ) {
+        return Err(FamilyPlanError::WrongReceiverKind { id: operation.id });
+      }
+    }
+    OperationKind::OutputStreamNext | OperationKind::OutputStreamCancel => {
+      if !matches!(
+        operation.receiver,
+        Some(ReceiverBinding::Resource(ResourceBinding {
+          kind: ResourceKind::OutputStream,
+          ..
+        }))
+      ) {
+        return Err(FamilyPlanError::WrongReceiverKind { id: operation.id });
+      }
+    }
+    _ => {}
   }
   if matches!(operation.kind, OperationKind::OutputStreamStart)
     && operation.result.map(|resource| resource.kind) != Some(ResourceKind::OutputStream)
@@ -793,22 +815,26 @@ fn add_runtime_entrypoints(
   target: FamilyOperationTarget,
   entrypoints: &mut BTreeSet<RuntimeEntrypoint>,
 ) {
-  if operation.receiver.map(|resource| resource.kind) == Some(ResourceKind::Object) {
-    entrypoints.insert(RuntimeEntrypoint::ReleaseObject);
-  }
-  if operation.receiver.map(|resource| resource.kind) == Some(ResourceKind::InputStream) {
-    entrypoints.extend([
-      RuntimeEntrypoint::PullInputStream,
-      RuntimeEntrypoint::CancelInputStream,
-      RuntimeEntrypoint::ReleaseInputStream,
-    ]);
-  }
-  if operation.receiver.map(|resource| resource.kind) == Some(ResourceKind::OutputStream) {
-    entrypoints.extend([
-      RuntimeEntrypoint::NextOutputStream,
-      RuntimeEntrypoint::CancelOutputStream,
-      RuntimeEntrypoint::ReleaseOutputStream,
-    ]);
+  if let Some(ReceiverBinding::Resource(resource)) = operation.receiver {
+    match resource.kind {
+      ResourceKind::Object => {
+        entrypoints.insert(RuntimeEntrypoint::ReleaseObject);
+      }
+      ResourceKind::InputStream => {
+        entrypoints.extend([
+          RuntimeEntrypoint::PullInputStream,
+          RuntimeEntrypoint::CancelInputStream,
+          RuntimeEntrypoint::ReleaseInputStream,
+        ]);
+      }
+      ResourceKind::OutputStream => {
+        entrypoints.extend([
+          RuntimeEntrypoint::NextOutputStream,
+          RuntimeEntrypoint::CancelOutputStream,
+          RuntimeEntrypoint::ReleaseOutputStream,
+        ]);
+      }
+    }
   }
   for callback in &operation.callbacks {
     if callback.contract.retention == CallbackRetention::Retained {
@@ -956,16 +982,14 @@ impl fmt::Display for FamilyPlanError {
       }
       Self::TooManyOperations => formatter.write_str("N-API operation table exceeds u32"),
       Self::MissingReceiver { id } => {
-        write!(formatter, "operation {id} requires a resource receiver")
+        write!(formatter, "operation {id} requires a receiver")
       }
-      Self::UnexpectedReceiver { id } => write!(
-        formatter,
-        "operation {id} unexpectedly has a resource receiver"
-      ),
-      Self::WrongReceiverKind { id } => write!(
-        formatter,
-        "operation {id} has an incompatible resource receiver"
-      ),
+      Self::UnexpectedReceiver { id } => {
+        write!(formatter, "operation {id} unexpectedly has a receiver")
+      }
+      Self::WrongReceiverKind { id } => {
+        write!(formatter, "operation {id} has an incompatible receiver")
+      }
       Self::MissingResultResource { id } => write!(
         formatter,
         "output-stream operation {id} has no result resource"
@@ -1245,6 +1269,63 @@ mod tests {
   }
 
   #[test]
+  fn method_receivers_preserve_value_or_resource_category() {
+    let mut value_method = operation(0, OperationKind::Method, OperationDispatch::Native);
+    value_method.receiver = Some(ReceiverBinding::Value);
+    let value_plan = FamilyPlan::build(FamilyPlanInput {
+      flavor: HostFlavor::Node,
+      close_policy: TEST_CLOSE_POLICY,
+      operations: vec![value_method],
+    })
+    .unwrap();
+    assert_eq!(
+      value_plan.operations()[0].receiver,
+      Some(ReceiverBinding::Value)
+    );
+    assert!(!value_plan
+      .runtime_entrypoints()
+      .any(|entry| entry == RuntimeEntrypoint::ReleaseObject));
+
+    let mut resource_method = operation(0, OperationKind::Method, OperationDispatch::Native);
+    resource_method.receiver = Some(ReceiverBinding::Resource(ResourceBinding {
+      kind: ResourceKind::Object,
+      ownership: ResourceOwnership::Borrowed,
+    }));
+    let resource_plan = FamilyPlan::build(FamilyPlanInput {
+      flavor: HostFlavor::Node,
+      close_policy: TEST_CLOSE_POLICY,
+      operations: vec![resource_method],
+    })
+    .unwrap();
+    assert!(matches!(
+      resource_plan.operations()[0].receiver,
+      Some(ReceiverBinding::Resource(ResourceBinding {
+        kind: ResourceKind::Object,
+        ownership: ResourceOwnership::Borrowed,
+      }))
+    ));
+    assert!(resource_plan
+      .runtime_entrypoints()
+      .any(|entry| entry == RuntimeEntrypoint::ReleaseObject));
+
+    let mut stream = operation(
+      0,
+      OperationKind::InputStreamPull,
+      OperationDispatch::InputStreamHostPull,
+    );
+    stream.async_kind = AsyncKind::Async;
+    stream.receiver = Some(ReceiverBinding::Value);
+    assert!(matches!(
+      FamilyPlan::build(FamilyPlanInput {
+        flavor: HostFlavor::Node,
+        close_policy: TEST_CLOSE_POLICY,
+        operations: vec![stream],
+      }),
+      Err(FamilyPlanError::WrongReceiverKind { id: 0 })
+    ));
+  }
+
+  #[test]
   fn callback_contract_and_stream_paths_are_retained_without_type_graph() {
     let mut op = operation(0, OperationKind::Function, OperationDispatch::Native);
     op.argument_count = 1;
@@ -1291,10 +1372,10 @@ mod tests {
       OperationDispatch::InputStreamHostPull,
     );
     pull.async_kind = AsyncKind::Async;
-    pull.receiver = Some(ResourceBinding {
+    pull.receiver = Some(ReceiverBinding::Resource(ResourceBinding {
       kind: ResourceKind::InputStream,
       ownership: ResourceOwnership::Borrowed,
-    });
+    }));
     pull.stream_slot = Some(StreamSlotIdentity {
       use_site_id: 0,
       operation_id: 1,
@@ -1306,10 +1387,10 @@ mod tests {
       OperationDispatch::InputStreamHostCancel,
     );
     cancel.async_kind = AsyncKind::Async;
-    cancel.receiver = Some(ResourceBinding {
+    cancel.receiver = Some(ReceiverBinding::Resource(ResourceBinding {
       kind: ResourceKind::InputStream,
       ownership: ResourceOwnership::Borrowed,
-    });
+    }));
     cancel.stream_slot = Some(StreamSlotIdentity {
       use_site_id: 0,
       operation_id: 2,

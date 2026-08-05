@@ -2,8 +2,9 @@ use napi_family_core::{
   AsyncKind, CallbackContract, CallbackReentrancy, CallbackRetention, CallbackThreading,
   CallbackUseSite, CarrierKind, ClosePolicy, ConversionRecipe, DeadlineAction,
   FamilyOperationInput, FamilyOperationTarget, FamilyPlan, FamilyPlanInput, HostFlavor,
-  OperationDispatch, OperationKind, ResourceBinding, ResourceKind, ResourceOwnership,
-  StreamDirection, StreamSlotIdentity, StreamUseSite, StreamValueBinding, ValuePath,
+  OperationDispatch, OperationKind, ReceiverBinding, ResourceBinding, ResourceKind,
+  ResourceOwnership, StreamDirection, StreamSlotIdentity, StreamUseSite, StreamValueBinding,
+  ValuePath,
 };
 use napi_uniffi_engine::{
   generate_napi_module, ArgumentBinding, ErrorBinding, ReturnBinding, RustArgumentPlan,
@@ -149,10 +150,10 @@ fn family(flavor: HostFlavor) -> FamilyPlan {
     kind: ResourceKind::Object,
     ownership: ResourceOwnership::Owned,
   });
-  operations[2].receiver = Some(ResourceBinding {
+  operations[2].receiver = Some(ReceiverBinding::Resource(ResourceBinding {
     kind: ResourceKind::Object,
     ownership: ResourceOwnership::Borrowed,
-  });
+  }));
   operations[4].callbacks.push(CallbackUseSite {
     operation_id: 4,
     callback_type_id: 3,
@@ -208,10 +209,10 @@ fn family(flavor: HostFlavor) -> FamilyPlan {
     (6, OperationKind::OutputStreamNext),
     (7, OperationKind::OutputStreamCancel),
   ] {
-    operations[id as usize].receiver = Some(ResourceBinding {
+    operations[id as usize].receiver = Some(ReceiverBinding::Resource(ResourceBinding {
       kind: ResourceKind::OutputStream,
       ownership: ResourceOwnership::Borrowed,
-    });
+    }));
     operations[id as usize].kind = kind;
     operations[id as usize].stream_slot = Some(StreamSlotIdentity {
       use_site_id: 0,
@@ -246,14 +247,14 @@ fn family(flavor: HostFlavor) -> FamilyPlan {
       },
     ],
   });
-  operations[9].receiver = Some(ResourceBinding {
+  operations[9].receiver = Some(ReceiverBinding::Resource(ResourceBinding {
     kind: ResourceKind::InputStream,
     ownership: ResourceOwnership::Borrowed,
-  });
-  operations[10].receiver = Some(ResourceBinding {
+  }));
+  operations[10].receiver = Some(ReceiverBinding::Resource(ResourceBinding {
     kind: ResourceKind::InputStream,
     ownership: ResourceOwnership::Borrowed,
-  });
+  }));
   operations[9].stream_slot = Some(StreamSlotIdentity {
     use_site_id: 1,
     operation_id: 9,
@@ -512,14 +513,13 @@ fn exposes_callback_stream_and_resource_runtime_hooks() {
   ] {
     assert!(entrypoints.contains(&expected), "missing {expected:?}");
   }
-  assert_eq!(
-    generated.family().operations()[2]
-      .receiver
-      .as_ref()
-      .unwrap()
-      .ownership,
-    ResourceOwnership::Borrowed
-  );
+  assert!(matches!(
+    generated.family().operations()[2].receiver,
+    Some(ReceiverBinding::Resource(ResourceBinding {
+      ownership: ResourceOwnership::Borrowed,
+      ..
+    }))
+  ));
   assert!(matches!(
     generated.family().operations()[3].target,
     FamilyOperationTarget::CallbackHost {
@@ -531,6 +531,140 @@ fn exposes_callback_stream_and_resource_runtime_hooks() {
     .source()
     .to_string()
     .contains("SessionCallbackReentrancy :: Forbidden"));
+}
+
+#[test]
+fn value_receivers_use_regular_lowering_and_never_resource_binding() {
+  let family = FamilyPlan::build(FamilyPlanInput {
+    flavor: HostFlavor::Node,
+    close_policy: TEST_CLOSE_POLICY,
+    operations: vec![FamilyOperationInput {
+      id: 0,
+      kind: OperationKind::Method,
+      async_kind: AsyncKind::Sync,
+      fallible: false,
+      argument_count: 0,
+      dispatch: OperationDispatch::Native,
+      receiver: Some(ReceiverBinding::Value),
+      result: None,
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    }],
+  })
+  .unwrap();
+  let valid = RustBridgePlan::build(
+    &family,
+    vec![RustOperationPlan {
+      operation_id: 0,
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::record_method),
+      },
+      receiver: Some(RustReceiverPlan {
+        name: ident("record"),
+        binding: ArgumentBinding::LowerWith {
+          carrier_type: syn::parse_quote!(napi::bindgen_prelude::Object<'static>),
+          lower: syn::parse_quote!(fixture::lower_record),
+        },
+      }),
+      arguments: Vec::new(),
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      error_binding: ErrorBinding::Infallible,
+    }],
+  )
+  .unwrap();
+  let generated = generate_napi_module(&family, &valid).unwrap();
+  let source = generated.source().to_string();
+  assert!(source.contains("fixture :: lower_record"));
+  assert!(source.contains("SessionReceiver :: Value"));
+  assert!(!source.contains("missing resource receiver"));
+
+  let invalid = RustBridgePlan::build(
+    &family,
+    vec![RustOperationPlan {
+      operation_id: 0,
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::record_method),
+      },
+      receiver: Some(RustReceiverPlan {
+        name: ident("record"),
+        binding: ArgumentBinding::ObjectLease {
+          carrier_type: syn::parse_quote!(u32),
+          lower: syn::parse_quote!(fixture::lower_object),
+          ownership: ResourceOwnership::Borrowed,
+        },
+      }),
+      arguments: Vec::new(),
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      error_binding: ErrorBinding::Infallible,
+    }],
+  )
+  .unwrap_err();
+  assert!(invalid.to_string().contains("regular value lowering"));
+}
+
+#[test]
+fn async_value_receiver_lowering_stays_outside_worker_future() {
+  let family = FamilyPlan::build(FamilyPlanInput {
+    flavor: HostFlavor::Node,
+    close_policy: TEST_CLOSE_POLICY,
+    operations: vec![FamilyOperationInput {
+      id: 0,
+      kind: OperationKind::Method,
+      async_kind: AsyncKind::Async,
+      fallible: false,
+      argument_count: 0,
+      dispatch: OperationDispatch::Native,
+      receiver: Some(ReceiverBinding::Value),
+      result: None,
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    }],
+  })
+  .unwrap();
+  let bridge = RustBridgePlan::build(
+    &family,
+    vec![RustOperationPlan {
+      operation_id: 0,
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::async_record_method),
+      },
+      receiver: Some(RustReceiverPlan {
+        name: ident("record"),
+        binding: ArgumentBinding::LowerWith {
+          carrier_type: syn::parse_quote!(napi::bindgen_prelude::Object<'static>),
+          lower: syn::parse_quote!(fixture::lower_record),
+        },
+      }),
+      arguments: Vec::new(),
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      error_binding: ErrorBinding::Infallible,
+    }],
+  )
+  .unwrap();
+  let source = generate_napi_module(&family, &bridge)
+    .unwrap()
+    .source()
+    .to_string();
+  assert!(source.contains("__uniffi_env"));
+  let lower_offset = source.find("fixture :: lower_record").unwrap();
+  let future_offset = source.find("let __uniffi_future = async move").unwrap();
+  assert!(lower_offset < future_offset);
+  let future_end = source[future_offset..]
+    .find("let __uniffi_promise")
+    .map(|offset| future_offset + offset)
+    .unwrap();
+  let future = &source[future_offset..future_end];
+  assert!(!future.contains("fixture :: lower_record"));
+  assert!(!future.contains("napi :: bindgen_prelude :: Object"));
+  assert!(!source.contains("async fn __uniffi_raw_operation_0"));
 }
 
 #[test]

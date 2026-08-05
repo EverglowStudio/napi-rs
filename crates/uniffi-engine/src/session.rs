@@ -625,6 +625,15 @@ pub enum SessionResourceReceiver {
   OutputStream,
 }
 
+/// Session-side receiver classification.  Value receivers occupy argument
+/// slot zero but are passed through unchanged and never enter resource lease
+/// tracking; resource receivers retain the existing handle/lease behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionReceiver {
+  Value,
+  Resource(SessionResourceReceiver),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionOperationDispatch {
   NativeSync,
@@ -652,7 +661,7 @@ pub struct SessionOperationDescriptor {
   pub dispatch: SessionOperationDispatch,
   pub callback: Option<sys::napi_value>,
   pub native_call: SessionNativeCall,
-  pub receiver: Option<SessionResourceReceiver>,
+  pub receiver: Option<SessionReceiver>,
   pub result: Option<SessionResourceReceiver>,
   pub callback_transfer: bool,
   pub callback_arguments: Vec<SessionCallbackArgument>,
@@ -685,7 +694,7 @@ struct SessionOperation {
   dispatch: SessionOperationDispatch,
   callback: Cell<sys::napi_ref>,
   native_call: SessionNativeCall,
-  receiver: Option<SessionResourceReceiver>,
+  receiver: Option<SessionReceiver>,
   result: Option<SessionResourceReceiver>,
   callback_transfer: bool,
   callback_arguments: Vec<SessionCallbackArgument>,
@@ -1140,7 +1149,7 @@ impl SessionState {
         }
       }
     }
-    if let Some(receiver) = operation.receiver {
+    if let Some(SessionReceiver::Resource(receiver)) = operation.receiver {
       let resource = *args
         .first()
         .ok_or_else(|| Error::new(Status::InvalidArg, "missing resource receiver"))?;
@@ -2075,7 +2084,7 @@ impl SessionState {
         let raw_result = (|| {
           let callback = reference_value(self.env, operation.callback.get(), "operation callback")?;
           let mut args = args;
-          if operation.receiver.is_some() {
+          if matches!(operation.receiver, Some(SessionReceiver::Resource(_))) {
             args[0] = named_property(self.env, args[0], "handle")?;
           }
           let mut native_args = Vec::with_capacity(
