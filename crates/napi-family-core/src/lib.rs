@@ -316,6 +316,17 @@ pub struct StreamSlotIdentity {
   pub kind: OperationKind,
 }
 
+/// A resource produced at a concrete use-site in an operation's return
+/// value.  Return resources are deliberately represented as a list rather
+/// than a single top-level binding: the returned value may contain resources
+/// below optional, record/enum, sequence, set, or map selectors.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResultResourceUseSite {
+  pub operation_id: u32,
+  pub path: ValuePath,
+  pub binding: ResourceBinding,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FamilyOperationInput {
   pub id: u32,
@@ -325,7 +336,7 @@ pub struct FamilyOperationInput {
   pub argument_count: usize,
   pub dispatch: OperationDispatch,
   pub receiver: Option<ReceiverBinding>,
-  pub result: Option<ResourceBinding>,
+  pub result_resources: Vec<ResultResourceUseSite>,
   pub callbacks: Vec<CallbackUseSite>,
   pub streams: Vec<StreamUseSite>,
   /// Synthetic stream slots carry their canonical use-site/slot identity so
@@ -376,7 +387,7 @@ pub struct FamilyOperation {
   pub fallible: bool,
   pub argument_count: usize,
   pub receiver: Option<ReceiverBinding>,
-  pub result: Option<ResourceBinding>,
+  pub result_resources: Vec<ResultResourceUseSite>,
   pub callbacks: Vec<CallbackUseSite>,
   pub streams: Vec<StreamUseSite>,
   pub stream_slot: Option<StreamSlotIdentity>,
@@ -459,6 +470,42 @@ impl FamilyPlan {
           });
         }
         validate_path(operation, &callback.path, "callback")?;
+      }
+      let mut result_paths = BTreeSet::new();
+      for result_resource in &operation.result_resources {
+        if result_resource.operation_id != operation.id {
+          return Err(FamilyPlanError::UseSiteOperationMismatch {
+            expected: operation.id,
+            actual: result_resource.operation_id,
+            role: "result resource",
+          });
+        }
+        validate_result_resource_path(operation, &result_resource.path)?;
+        if result_resource.binding.ownership != ResourceOwnership::Owned {
+          return Err(FamilyPlanError::NonOwnedResultResource {
+            id: operation.id,
+            ownership: result_resource.binding.ownership,
+          });
+        }
+        let path = result_resource.path.to_string();
+        if !result_paths.insert(path.clone()) {
+          if let Some(previous) = operation
+            .result_resources
+            .iter()
+            .find(|candidate| candidate.path.to_string() == path)
+          {
+            if previous.binding == result_resource.binding {
+              return Err(FamilyPlanError::DuplicateResultResourceUseSite {
+                id: operation.id,
+                path,
+              });
+            }
+          }
+          return Err(FamilyPlanError::ConflictingResultResourceUseSite {
+            id: operation.id,
+            path,
+          });
+        }
       }
       for stream in &operation.streams {
         if stream.operation_id != operation.id {
@@ -615,7 +662,7 @@ impl FamilyPlan {
           fallible: operation.fallible,
           argument_count: operation.argument_count,
           receiver: operation.receiver,
-          result: operation.result,
+          result_resources: operation.result_resources,
           callbacks: operation.callbacks,
           streams: operation.streams,
           stream_slot: operation.stream_slot,
@@ -726,7 +773,10 @@ fn validate_operation_shape(operation: &FamilyOperationInput) -> Result<(), Fami
     _ => {}
   }
   if matches!(operation.kind, OperationKind::OutputStreamStart)
-    && operation.result.map(|resource| resource.kind) != Some(ResourceKind::OutputStream)
+    && !operation.result_resources.iter().any(|resource| {
+      matches!(resource.path.segments(), [ValuePathSegment::Return])
+        && resource.binding.kind == ResourceKind::OutputStream
+    })
   {
     return Err(FamilyPlanError::MissingResultResource { id: operation.id });
   }
@@ -751,7 +801,7 @@ fn validate_operation_shape(operation: &FamilyOperationInput) -> Result<(), Fami
   if matches!(
     operation.kind,
     OperationKind::InputStreamCancel | OperationKind::OutputStreamCancel
-  ) && operation.result.is_some()
+  ) && !operation.result_resources.is_empty()
   {
     return Err(FamilyPlanError::CancelHasResult { id: operation.id });
   }
@@ -761,6 +811,36 @@ fn validate_operation_shape(operation: &FamilyOperationInput) -> Result<(), Fami
   ) && operation.async_kind != AsyncKind::Async
   {
     return Err(FamilyPlanError::HostOperationMustBeAsync { id: operation.id });
+  }
+  Ok(())
+}
+
+fn validate_result_resource_path(
+  operation: &FamilyOperationInput,
+  path: &ValuePath,
+) -> Result<(), FamilyPlanError> {
+  if path.segments().is_empty() {
+    return Err(FamilyPlanError::EmptyPath {
+      id: operation.id,
+      role: "result resource",
+    });
+  }
+  if !matches!(path.segments().first(), Some(ValuePathSegment::Return)) {
+    return Err(FamilyPlanError::InvalidPathRoot {
+      id: operation.id,
+      role: "result resource",
+    });
+  }
+  if path.segments().iter().skip(1).any(|segment| {
+    matches!(
+      segment,
+      ValuePathSegment::Argument(_) | ValuePathSegment::Return
+    )
+  }) {
+    return Err(FamilyPlanError::NestedRootSegment {
+      id: operation.id,
+      role: "result resource",
+    });
   }
   Ok(())
 }
@@ -850,6 +930,23 @@ fn add_runtime_entrypoints(
       AsyncKind::Async => RuntimeEntrypoint::InvokeCallbackAsync,
     });
   }
+  for result in &operation.result_resources {
+    match result.binding.kind {
+      ResourceKind::Object => {
+        entrypoints.insert(RuntimeEntrypoint::ReleaseObject);
+      }
+      ResourceKind::InputStream => entrypoints.extend([
+        RuntimeEntrypoint::PullInputStream,
+        RuntimeEntrypoint::CancelInputStream,
+        RuntimeEntrypoint::ReleaseInputStream,
+      ]),
+      ResourceKind::OutputStream => entrypoints.extend([
+        RuntimeEntrypoint::NextOutputStream,
+        RuntimeEntrypoint::CancelOutputStream,
+        RuntimeEntrypoint::ReleaseOutputStream,
+      ]),
+    }
+  }
   for stream in &operation.streams {
     match stream.direction {
       StreamDirection::Input => entrypoints.extend([
@@ -900,6 +997,18 @@ pub enum FamilyPlanError {
   },
   CancelHasResult {
     id: u32,
+  },
+  NonOwnedResultResource {
+    id: u32,
+    ownership: ResourceOwnership,
+  },
+  DuplicateResultResourceUseSite {
+    id: u32,
+    path: String,
+  },
+  ConflictingResultResourceUseSite {
+    id: u32,
+    path: String,
   },
   UseSiteOperationMismatch {
     expected: u32,
@@ -1007,6 +1116,18 @@ impl fmt::Display for FamilyPlanError {
           "stream cancel operation {id} must not return a payload"
         )
       }
+      Self::NonOwnedResultResource { id, ownership } => write!(
+        formatter,
+        "operation {id} has non-owned result resource binding {ownership:?}"
+      ),
+      Self::DuplicateResultResourceUseSite { id, path } => write!(
+        formatter,
+        "operation {id} declares duplicate result resource use-site {path}"
+      ),
+      Self::ConflictingResultResourceUseSite { id, path } => write!(
+        formatter,
+        "operation {id} declares conflicting result resource use-site {path}"
+      ),
       Self::UseSiteOperationMismatch {
         expected,
         actual,
@@ -1172,7 +1293,7 @@ mod tests {
       argument_count: 0,
       dispatch,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -1397,9 +1518,13 @@ mod tests {
       kind: OperationKind::InputStreamCancel,
     });
     let mut bad_cancel = cancel.clone();
-    bad_cancel.result = Some(ResourceBinding {
-      kind: ResourceKind::OutputStream,
-      ownership: ResourceOwnership::Owned,
+    bad_cancel.result_resources.push(ResultResourceUseSite {
+      operation_id: bad_cancel.id,
+      path: ValuePath::return_value(),
+      binding: ResourceBinding {
+        kind: ResourceKind::OutputStream,
+        ownership: ResourceOwnership::Owned,
+      },
     });
     let error = FamilyPlan::build(FamilyPlanInput {
       flavor: HostFlavor::Ohos,
@@ -1510,5 +1635,173 @@ mod tests {
       operations: vec![valid],
     })
     .unwrap();
+  }
+
+  #[test]
+  fn result_resource_paths_are_return_rooted_owned_and_unique() {
+    let mut operation = operation(0, OperationKind::Function, OperationDispatch::Native);
+    operation.result_resources.push(ResultResourceUseSite {
+      operation_id: 0,
+      path: ValuePath::new(vec![
+        ValuePathSegment::Return,
+        ValuePathSegment::Field("object".into()),
+        ValuePathSegment::Optional,
+      ]),
+      binding: ResourceBinding {
+        kind: ResourceKind::Object,
+        ownership: ResourceOwnership::Owned,
+      },
+    });
+    operation.result_resources.push(ResultResourceUseSite {
+      operation_id: 0,
+      path: ValuePath::new(vec![
+        ValuePathSegment::Return,
+        ValuePathSegment::SequenceElement,
+        ValuePathSegment::Field("stream".into()),
+      ]),
+      binding: ResourceBinding {
+        kind: ResourceKind::OutputStream,
+        ownership: ResourceOwnership::Owned,
+      },
+    });
+    for (path, kind) in [
+      (
+        ValuePath::new(vec![
+          ValuePathSegment::Return,
+          ValuePathSegment::Variant("Ready".into()),
+          ValuePathSegment::Field("object".into()),
+        ]),
+        ResourceKind::Object,
+      ),
+      (
+        ValuePath::new(vec![
+          ValuePathSegment::Return,
+          ValuePathSegment::SetElement,
+          ValuePathSegment::Field("object".into()),
+        ]),
+        ResourceKind::Object,
+      ),
+      (
+        ValuePath::new(vec![
+          ValuePathSegment::Return,
+          ValuePathSegment::MapKey,
+          ValuePathSegment::Field("object".into()),
+        ]),
+        ResourceKind::Object,
+      ),
+      (
+        ValuePath::new(vec![
+          ValuePathSegment::Return,
+          ValuePathSegment::MapValue,
+          ValuePathSegment::Field("object".into()),
+        ]),
+        ResourceKind::Object,
+      ),
+    ] {
+      operation.result_resources.push(ResultResourceUseSite {
+        operation_id: 0,
+        path,
+        binding: ResourceBinding {
+          kind,
+          ownership: ResourceOwnership::Owned,
+        },
+      });
+    }
+    let plan = FamilyPlan::build(FamilyPlanInput {
+      flavor: HostFlavor::Node,
+      close_policy: TEST_CLOSE_POLICY,
+      operations: vec![operation.clone()],
+    })
+    .unwrap();
+    assert_eq!(plan.operations()[0].result_resources.len(), 6);
+
+    let mut invalid = operation.clone();
+    invalid.result_resources[0].path = ValuePath::argument(0);
+    assert!(matches!(
+      FamilyPlan::build(FamilyPlanInput {
+        flavor: HostFlavor::Node,
+        close_policy: TEST_CLOSE_POLICY,
+        operations: vec![invalid],
+      }),
+      Err(FamilyPlanError::InvalidPathRoot {
+        role: "result resource",
+        ..
+      })
+    ));
+
+    let mut borrowed = operation.clone();
+    borrowed.result_resources[0].binding.ownership = ResourceOwnership::Borrowed;
+    assert!(matches!(
+      FamilyPlan::build(FamilyPlanInput {
+        flavor: HostFlavor::Node,
+        close_policy: TEST_CLOSE_POLICY,
+        operations: vec![borrowed],
+      }),
+      Err(FamilyPlanError::NonOwnedResultResource { .. })
+    ));
+
+    let mut by_arc = operation.clone();
+    by_arc.result_resources[0].binding.ownership = ResourceOwnership::ByArc;
+    assert!(matches!(
+      FamilyPlan::build(FamilyPlanInput {
+        flavor: HostFlavor::Node,
+        close_policy: TEST_CLOSE_POLICY,
+        operations: vec![by_arc],
+      }),
+      Err(FamilyPlanError::NonOwnedResultResource { .. })
+    ));
+
+    let mut nested_root = operation.clone();
+    nested_root.result_resources[0].path = ValuePath::new(vec![
+      ValuePathSegment::Return,
+      ValuePathSegment::Field("object".into()),
+      ValuePathSegment::Argument(0),
+    ]);
+    assert!(matches!(
+      FamilyPlan::build(FamilyPlanInput {
+        flavor: HostFlavor::Node,
+        close_policy: TEST_CLOSE_POLICY,
+        operations: vec![nested_root],
+      }),
+      Err(FamilyPlanError::NestedRootSegment {
+        role: "result resource",
+        ..
+      })
+    ));
+
+    let mut duplicate = operation.clone();
+    duplicate
+      .result_resources
+      .push(duplicate.result_resources[0].clone());
+    assert!(matches!(
+      FamilyPlan::build(FamilyPlanInput {
+        flavor: HostFlavor::Node,
+        close_policy: TEST_CLOSE_POLICY,
+        operations: vec![duplicate],
+      }),
+      Err(FamilyPlanError::DuplicateResultResourceUseSite { .. })
+    ));
+
+    let mut conflict = operation;
+    conflict.result_resources.push(ResultResourceUseSite {
+      operation_id: 0,
+      path: ValuePath::new(vec![
+        ValuePathSegment::Return,
+        ValuePathSegment::Field("object".into()),
+        ValuePathSegment::Optional,
+      ]),
+      binding: ResourceBinding {
+        kind: ResourceKind::InputStream,
+        ownership: ResourceOwnership::Owned,
+      },
+    });
+    assert!(matches!(
+      FamilyPlan::build(FamilyPlanInput {
+        flavor: HostFlavor::Node,
+        close_policy: TEST_CLOSE_POLICY,
+        operations: vec![conflict],
+      }),
+      Err(FamilyPlanError::ConflictingResultResourceUseSite { .. })
+    ));
   }
 }

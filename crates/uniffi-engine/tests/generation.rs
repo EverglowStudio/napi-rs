@@ -3,8 +3,8 @@ use napi_family_core::{
   CallbackUseSite, CarrierKind, ClosePolicy, ConversionRecipe, DeadlineAction,
   FamilyOperationInput, FamilyOperationTarget, FamilyPlan, FamilyPlanInput, HostFlavor,
   OperationDispatch, OperationKind, ReceiverBinding, ResourceBinding, ResourceKind,
-  ResourceOwnership, StreamDirection, StreamSlotIdentity, StreamUseSite, StreamValueBinding,
-  ValuePath,
+  ResourceOwnership, ResultResourceUseSite, StreamDirection, StreamSlotIdentity, StreamUseSite,
+  StreamValueBinding, ValuePath,
 };
 use napi_uniffi_engine::{
   generate_napi_module, ArgumentBinding, ErrorBinding, ReturnBinding, RustArgumentPlan,
@@ -45,7 +45,7 @@ fn family_operation(
     argument_count,
     dispatch,
     receiver: None,
-    result: None,
+    result_resources: Vec::new(),
     callbacks: Vec::new(),
     streams: Vec::new(),
     stream_slot: None,
@@ -146,9 +146,13 @@ fn family(flavor: HostFlavor) -> FamilyPlan {
       OperationDispatch::InputStreamHostCancel,
     ),
   ];
-  operations[1].result = Some(ResourceBinding {
-    kind: ResourceKind::Object,
-    ownership: ResourceOwnership::Owned,
+  operations[1].result_resources.push(ResultResourceUseSite {
+    operation_id: 1,
+    path: ValuePath::return_value(),
+    binding: ResourceBinding {
+      kind: ResourceKind::Object,
+      ownership: ResourceOwnership::Owned,
+    },
   });
   operations[2].receiver = Some(ReceiverBinding::Resource(ResourceBinding {
     kind: ResourceKind::Object,
@@ -164,9 +168,13 @@ fn family(flavor: HostFlavor) -> FamilyPlan {
       reentrancy: CallbackReentrancy::Forbidden,
     },
   });
-  operations[5].result = Some(ResourceBinding {
-    kind: ResourceKind::OutputStream,
-    ownership: ResourceOwnership::Owned,
+  operations[5].result_resources.push(ResultResourceUseSite {
+    operation_id: 5,
+    path: ValuePath::return_value(),
+    binding: ResourceBinding {
+      kind: ResourceKind::OutputStream,
+      ownership: ResourceOwnership::Owned,
+    },
   });
   operations[5].streams.push(StreamUseSite {
     operation_id: 5,
@@ -546,7 +554,7 @@ fn value_receivers_use_regular_lowering_and_never_resource_binding() {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: Some(ReceiverBinding::Value),
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -620,7 +628,7 @@ fn async_value_receiver_lowering_stays_outside_worker_future() {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: Some(ReceiverBinding::Value),
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -719,7 +727,7 @@ fn structured_bindings_match_every_canonical_use_site() {
     argument_count: 1,
     dispatch: OperationDispatch::Native,
     receiver: None,
-    result: None,
+    result_resources: Vec::new(),
     callbacks: vec![CallbackUseSite {
       operation_id: 0,
       callback_type_id: 3,
@@ -890,7 +898,7 @@ fn structured_bindings_match_every_canonical_use_site() {
         method_id: 0,
       },
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: vec![CallbackUseSite {
         operation_id: 0,
         callback_type_id: 3,
@@ -957,4 +965,65 @@ fn resource_results_are_mechanically_bound_to_return_carriers() {
   )
   .unwrap_err();
   assert!(error.to_string().contains("return binding incompatible"));
+}
+
+#[test]
+fn nested_result_resource_paths_reach_the_session_descriptor() {
+  let mut operation = family_operation(
+    0,
+    OperationKind::Function,
+    AsyncKind::Sync,
+    0,
+    false,
+    OperationDispatch::Native,
+  );
+  operation.result_resources.push(ResultResourceUseSite {
+    operation_id: 0,
+    path: ValuePath::new(vec![
+      napi_family_core::ValuePathSegment::Return,
+      napi_family_core::ValuePathSegment::Field("optional".to_owned()),
+      napi_family_core::ValuePathSegment::Optional,
+      napi_family_core::ValuePathSegment::Field("object".to_owned()),
+    ]),
+    binding: ResourceBinding {
+      kind: ResourceKind::Object,
+      ownership: ResourceOwnership::Owned,
+    },
+  });
+  let family = FamilyPlan::build(FamilyPlanInput {
+    flavor: HostFlavor::Node,
+    close_policy: TEST_CLOSE_POLICY,
+    operations: vec![operation],
+  })
+  .unwrap();
+  let bridge = RustBridgePlan::build_with_resource_hooks(
+    &family,
+    vec![native(
+      0,
+      syn::parse_quote!(fixture::nested_result),
+      Vec::new(),
+      ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(u32),
+      },
+      ErrorBinding::Infallible,
+    )],
+    RustResourceHooks {
+      release_object: Some(RustResourceHook {
+        call: syn::parse_quote!(fixture::release_object),
+        carrier_type: syn::parse_quote!(fixture::ObjectHandle),
+      }),
+      cancel_output_stream: None,
+      release_output_stream: None,
+    },
+  )
+  .unwrap();
+  let source = generate_napi_module(&family, &bridge)
+    .unwrap()
+    .source()
+    .to_string();
+  assert!(source.contains("SessionResultResourceUseSite"));
+  assert!(source.contains("SessionResourceOwnership :: Owned"));
+  assert!(source.contains("optional"));
+  assert!(source.contains("object"));
+  assert!(source.contains("SessionResourceReceiver :: Object"));
 }

@@ -34,7 +34,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -47,7 +47,7 @@ fn family() -> FamilyPlan {
       argument_count: 1,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -63,7 +63,7 @@ fn family() -> FamilyPlan {
         method_id: 0,
       },
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -76,7 +76,7 @@ fn family() -> FamilyPlan {
       argument_count: 1,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: vec![
         CallbackUseSite {
           operation_id: 3,
@@ -233,7 +233,7 @@ fn family() -> FamilyPlan {
       argument_count: 1,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: vec![StreamUseSite {
         operation_id: 4,
@@ -272,7 +272,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::InputStreamHostPull,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -285,7 +285,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::InputStreamHostCancel,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -300,10 +300,14 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: Some(ResourceBinding {
-        kind: ResourceKind::Object,
-        ownership: ResourceOwnership::Owned,
-      }),
+      result_resources: vec![napi_family_core::ResultResourceUseSite {
+        operation_id: 7,
+        path: ValuePath::return_value(),
+        binding: ResourceBinding {
+          kind: ResourceKind::Object,
+          ownership: ResourceOwnership::Owned,
+        },
+      }],
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -316,10 +320,14 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: Some(ResourceBinding {
-        kind: ResourceKind::Object,
-        ownership: ResourceOwnership::Owned,
-      }),
+      result_resources: vec![napi_family_core::ResultResourceUseSite {
+        operation_id: 8,
+        path: ValuePath::return_value(),
+        binding: ResourceBinding {
+          kind: ResourceKind::Object,
+          ownership: ResourceOwnership::Owned,
+        },
+      }],
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -332,10 +340,14 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: Some(ResourceBinding {
-        kind: ResourceKind::OutputStream,
-        ownership: ResourceOwnership::Owned,
-      }),
+      result_resources: vec![napi_family_core::ResultResourceUseSite {
+        operation_id: 9,
+        path: ValuePath::return_value(),
+        binding: ResourceBinding {
+          kind: ResourceKind::OutputStream,
+          ownership: ResourceOwnership::Owned,
+        },
+      }],
       callbacks: Vec::new(),
       streams: vec![StreamUseSite {
         operation_id: 9,
@@ -386,7 +398,7 @@ fn family() -> FamilyPlan {
         kind: ResourceKind::OutputStream,
         ownership: ResourceOwnership::Borrowed,
       })),
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: Some(StreamSlotIdentity {
@@ -406,7 +418,7 @@ fn family() -> FamilyPlan {
         kind: ResourceKind::OutputStream,
         ownership: ResourceOwnership::Borrowed,
       })),
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: Some(StreamSlotIdentity {
@@ -423,10 +435,14 @@ fn family() -> FamilyPlan {
       argument_count: 1,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: Some(ResourceBinding {
-        kind: ResourceKind::OutputStream,
-        ownership: ResourceOwnership::Owned,
-      }),
+      result_resources: vec![napi_family_core::ResultResourceUseSite {
+        operation_id: 12,
+        path: ValuePath::return_value(),
+        binding: ResourceBinding {
+          kind: ResourceKind::OutputStream,
+          ownership: ResourceOwnership::Owned,
+        },
+      }],
       callbacks: Vec::new(),
       streams: vec![
         StreamUseSite {
@@ -506,7 +522,7 @@ fn family() -> FamilyPlan {
         kind: ResourceKind::OutputStream,
         ownership: ResourceOwnership::Borrowed,
       })),
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: Some(StreamSlotIdentity {
@@ -526,7 +542,7 @@ fn family() -> FamilyPlan {
         kind: ResourceKind::OutputStream,
         ownership: ResourceOwnership::Borrowed,
       })),
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: Some(StreamSlotIdentity {
@@ -546,7 +562,7 @@ fn family() -> FamilyPlan {
         kind: ResourceKind::InputStream,
         ownership: ResourceOwnership::Borrowed,
       })),
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: Some(StreamSlotIdentity {
@@ -566,7 +582,7 @@ fn family() -> FamilyPlan {
         kind: ResourceKind::InputStream,
         ownership: ResourceOwnership::Borrowed,
       })),
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: Some(StreamSlotIdentity {
@@ -586,7 +602,7 @@ fn family() -> FamilyPlan {
         method_id: 1,
       },
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -602,7 +618,7 @@ fn family() -> FamilyPlan {
         method_id: 2,
       },
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -618,7 +634,7 @@ fn family() -> FamilyPlan {
         method_id: 3,
       },
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -634,7 +650,7 @@ fn family() -> FamilyPlan {
         method_id: 4,
       },
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -647,7 +663,7 @@ fn family() -> FamilyPlan {
       argument_count: 1,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: vec![CallbackUseSite {
         operation_id: 21,
         callback_type_id: 0,
@@ -669,7 +685,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -682,7 +698,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -695,7 +711,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -708,7 +724,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -721,7 +737,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -734,7 +750,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: vec![CallbackUseSite {
         operation_id: 27,
         callback_type_id: 0,
@@ -759,7 +775,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -772,7 +788,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -785,10 +801,14 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: Some(ResourceBinding {
-        kind: ResourceKind::OutputStream,
-        ownership: ResourceOwnership::Owned,
-      }),
+      result_resources: vec![napi_family_core::ResultResourceUseSite {
+        operation_id: 30,
+        path: ValuePath::return_value(),
+        binding: ResourceBinding {
+          kind: ResourceKind::OutputStream,
+          ownership: ResourceOwnership::Owned,
+        },
+      }],
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -801,7 +821,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -814,7 +834,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -827,7 +847,7 @@ fn family() -> FamilyPlan {
       argument_count: 1,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: vec![CallbackUseSite {
         operation_id: 33,
         callback_type_id: 0,
@@ -849,10 +869,14 @@ fn family() -> FamilyPlan {
       argument_count: 1,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: Some(ResourceBinding {
-        kind: ResourceKind::Object,
-        ownership: ResourceOwnership::Owned,
-      }),
+      result_resources: vec![napi_family_core::ResultResourceUseSite {
+        operation_id: 34,
+        path: ValuePath::return_value(),
+        binding: ResourceBinding {
+          kind: ResourceKind::Object,
+          ownership: ResourceOwnership::Owned,
+        },
+      }],
       callbacks: vec![CallbackUseSite {
         operation_id: 34,
         callback_type_id: 0,
@@ -874,10 +898,14 @@ fn family() -> FamilyPlan {
       argument_count: 1,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: Some(ResourceBinding {
-        kind: ResourceKind::OutputStream,
-        ownership: ResourceOwnership::Owned,
-      }),
+      result_resources: vec![napi_family_core::ResultResourceUseSite {
+        operation_id: 35,
+        path: ValuePath::return_value(),
+        binding: ResourceBinding {
+          kind: ResourceKind::OutputStream,
+          ownership: ResourceOwnership::Owned,
+        },
+      }],
       callbacks: vec![CallbackUseSite {
         operation_id: 35,
         callback_type_id: 0,
@@ -899,7 +927,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -912,7 +940,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -925,7 +953,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -938,7 +966,7 @@ fn family() -> FamilyPlan {
       argument_count: 1,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -951,7 +979,7 @@ fn family() -> FamilyPlan {
       argument_count: 1,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -964,7 +992,7 @@ fn family() -> FamilyPlan {
       argument_count: 1,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -977,7 +1005,7 @@ fn family() -> FamilyPlan {
       argument_count: 1,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: vec![CallbackUseSite {
         operation_id: 42,
         callback_type_id: 0,
@@ -999,7 +1027,7 @@ fn family() -> FamilyPlan {
       argument_count: 1,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: vec![CallbackUseSite {
         operation_id: 43,
         callback_type_id: 0,
@@ -1021,7 +1049,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: None,
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -1034,7 +1062,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: Some(ReceiverBinding::Value),
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -1047,7 +1075,7 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: Some(ReceiverBinding::Value),
-      result: None,
+      result_resources: Vec::new(),
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -1060,7 +1088,313 @@ fn family() -> FamilyPlan {
       argument_count: 0,
       dispatch: OperationDispatch::Native,
       receiver: Some(ReceiverBinding::Value),
-      result: None,
+      result_resources: Vec::new(),
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 48,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Sync,
+      fallible: false,
+      argument_count: 1,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result_resources: vec![
+        napi_family_core::ResultResourceUseSite {
+          operation_id: 48,
+          path: ValuePath::new(vec![
+            napi_family_core::ValuePathSegment::Return,
+            napi_family_core::ValuePathSegment::Field("optionalObject".to_owned()),
+            napi_family_core::ValuePathSegment::Optional,
+          ]),
+          binding: ResourceBinding {
+            kind: ResourceKind::Object,
+            ownership: ResourceOwnership::Owned,
+          },
+        },
+        napi_family_core::ResultResourceUseSite {
+          operation_id: 48,
+          path: ValuePath::new(vec![
+            napi_family_core::ValuePathSegment::Return,
+            napi_family_core::ValuePathSegment::Field("objects".to_owned()),
+            napi_family_core::ValuePathSegment::SequenceElement,
+          ]),
+          binding: ResourceBinding {
+            kind: ResourceKind::Object,
+            ownership: ResourceOwnership::Owned,
+          },
+        },
+        napi_family_core::ResultResourceUseSite {
+          operation_id: 48,
+          path: ValuePath::new(vec![
+            napi_family_core::ValuePathSegment::Return,
+            napi_family_core::ValuePathSegment::Field("variant".to_owned()),
+            napi_family_core::ValuePathSegment::Variant("Ready".to_owned()),
+            napi_family_core::ValuePathSegment::Field("object".to_owned()),
+          ]),
+          binding: ResourceBinding {
+            kind: ResourceKind::Object,
+            ownership: ResourceOwnership::Owned,
+          },
+        },
+      ],
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 49,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Sync,
+      fallible: false,
+      argument_count: 0,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result_resources: vec![
+        napi_family_core::ResultResourceUseSite {
+          operation_id: 49,
+          path: ValuePath::new(vec![
+            napi_family_core::ValuePathSegment::Return,
+            napi_family_core::ValuePathSegment::Field("optionalOutput".to_owned()),
+            napi_family_core::ValuePathSegment::Optional,
+          ]),
+          binding: ResourceBinding {
+            kind: ResourceKind::OutputStream,
+            ownership: ResourceOwnership::Owned,
+          },
+        },
+        napi_family_core::ResultResourceUseSite {
+          operation_id: 49,
+          path: ValuePath::new(vec![
+            napi_family_core::ValuePathSegment::Return,
+            napi_family_core::ValuePathSegment::Field("outputs".to_owned()),
+            napi_family_core::ValuePathSegment::SequenceElement,
+          ]),
+          binding: ResourceBinding {
+            kind: ResourceKind::OutputStream,
+            ownership: ResourceOwnership::Owned,
+          },
+        },
+        napi_family_core::ResultResourceUseSite {
+          operation_id: 49,
+          path: ValuePath::new(vec![
+            napi_family_core::ValuePathSegment::Return,
+            napi_family_core::ValuePathSegment::Field("variant".to_owned()),
+            napi_family_core::ValuePathSegment::Variant("Ready".to_owned()),
+            napi_family_core::ValuePathSegment::Field("output".to_owned()),
+          ]),
+          binding: ResourceBinding {
+            kind: ResourceKind::OutputStream,
+            ownership: ResourceOwnership::Owned,
+          },
+        },
+      ],
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 50,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Async,
+      fallible: false,
+      argument_count: 0,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result_resources: vec![
+        napi_family_core::ResultResourceUseSite {
+          operation_id: 50,
+          path: ValuePath::new(vec![
+            napi_family_core::ValuePathSegment::Return,
+            napi_family_core::ValuePathSegment::Field("optionalObject".to_owned()),
+            napi_family_core::ValuePathSegment::Optional,
+          ]),
+          binding: ResourceBinding {
+            kind: ResourceKind::Object,
+            ownership: ResourceOwnership::Owned,
+          },
+        },
+        napi_family_core::ResultResourceUseSite {
+          operation_id: 50,
+          path: ValuePath::new(vec![
+            napi_family_core::ValuePathSegment::Return,
+            napi_family_core::ValuePathSegment::Field("objects".to_owned()),
+            napi_family_core::ValuePathSegment::SequenceElement,
+          ]),
+          binding: ResourceBinding {
+            kind: ResourceKind::Object,
+            ownership: ResourceOwnership::Owned,
+          },
+        },
+        napi_family_core::ResultResourceUseSite {
+          operation_id: 50,
+          path: ValuePath::new(vec![
+            napi_family_core::ValuePathSegment::Return,
+            napi_family_core::ValuePathSegment::Field("variant".to_owned()),
+            napi_family_core::ValuePathSegment::Variant("Ready".to_owned()),
+            napi_family_core::ValuePathSegment::Field("object".to_owned()),
+          ]),
+          binding: ResourceBinding {
+            kind: ResourceKind::Object,
+            ownership: ResourceOwnership::Owned,
+          },
+        },
+      ],
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 51,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Async,
+      fallible: false,
+      argument_count: 0,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result_resources: vec![
+        napi_family_core::ResultResourceUseSite {
+          operation_id: 51,
+          path: ValuePath::new(vec![
+            napi_family_core::ValuePathSegment::Return,
+            napi_family_core::ValuePathSegment::Field("optionalOutput".to_owned()),
+            napi_family_core::ValuePathSegment::Optional,
+          ]),
+          binding: ResourceBinding {
+            kind: ResourceKind::OutputStream,
+            ownership: ResourceOwnership::Owned,
+          },
+        },
+        napi_family_core::ResultResourceUseSite {
+          operation_id: 51,
+          path: ValuePath::new(vec![
+            napi_family_core::ValuePathSegment::Return,
+            napi_family_core::ValuePathSegment::Field("outputs".to_owned()),
+            napi_family_core::ValuePathSegment::SequenceElement,
+          ]),
+          binding: ResourceBinding {
+            kind: ResourceKind::OutputStream,
+            ownership: ResourceOwnership::Owned,
+          },
+        },
+        napi_family_core::ResultResourceUseSite {
+          operation_id: 51,
+          path: ValuePath::new(vec![
+            napi_family_core::ValuePathSegment::Return,
+            napi_family_core::ValuePathSegment::Field("variant".to_owned()),
+            napi_family_core::ValuePathSegment::Variant("Ready".to_owned()),
+            napi_family_core::ValuePathSegment::Field("output".to_owned()),
+          ]),
+          binding: ResourceBinding {
+            kind: ResourceKind::OutputStream,
+            ownership: ResourceOwnership::Owned,
+          },
+        },
+      ],
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 52,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Async,
+      fallible: false,
+      argument_count: 0,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result_resources: vec![
+        napi_family_core::ResultResourceUseSite {
+          operation_id: 52,
+          path: ValuePath::new(vec![
+            napi_family_core::ValuePathSegment::Return,
+            napi_family_core::ValuePathSegment::Field("optionalInput".to_owned()),
+            napi_family_core::ValuePathSegment::Optional,
+          ]),
+          binding: ResourceBinding {
+            kind: ResourceKind::InputStream,
+            ownership: ResourceOwnership::Owned,
+          },
+        },
+        napi_family_core::ResultResourceUseSite {
+          operation_id: 52,
+          path: ValuePath::new(vec![
+            napi_family_core::ValuePathSegment::Return,
+            napi_family_core::ValuePathSegment::Field("inputs".to_owned()),
+            napi_family_core::ValuePathSegment::SequenceElement,
+          ]),
+          binding: ResourceBinding {
+            kind: ResourceKind::InputStream,
+            ownership: ResourceOwnership::Owned,
+          },
+        },
+        napi_family_core::ResultResourceUseSite {
+          operation_id: 52,
+          path: ValuePath::new(vec![
+            napi_family_core::ValuePathSegment::Return,
+            napi_family_core::ValuePathSegment::Field("variant".to_owned()),
+            napi_family_core::ValuePathSegment::Variant("Ready".to_owned()),
+            napi_family_core::ValuePathSegment::Field("input".to_owned()),
+          ]),
+          binding: ResourceBinding {
+            kind: ResourceKind::InputStream,
+            ownership: ResourceOwnership::Owned,
+          },
+        },
+      ],
+      callbacks: Vec::new(),
+      streams: Vec::new(),
+      stream_slot: None,
+    },
+    FamilyOperationInput {
+      id: 53,
+      kind: OperationKind::Function,
+      async_kind: AsyncKind::Sync,
+      fallible: false,
+      argument_count: 0,
+      dispatch: OperationDispatch::Native,
+      receiver: None,
+      result_resources: vec![
+        napi_family_core::ResultResourceUseSite {
+          operation_id: 53,
+          path: ValuePath::new(vec![
+            napi_family_core::ValuePathSegment::Return,
+            napi_family_core::ValuePathSegment::Field("optionalInput".to_owned()),
+            napi_family_core::ValuePathSegment::Optional,
+          ]),
+          binding: ResourceBinding {
+            kind: ResourceKind::InputStream,
+            ownership: ResourceOwnership::Owned,
+          },
+        },
+        napi_family_core::ResultResourceUseSite {
+          operation_id: 53,
+          path: ValuePath::new(vec![
+            napi_family_core::ValuePathSegment::Return,
+            napi_family_core::ValuePathSegment::Field("inputs".to_owned()),
+            napi_family_core::ValuePathSegment::SequenceElement,
+          ]),
+          binding: ResourceBinding {
+            kind: ResourceKind::InputStream,
+            ownership: ResourceOwnership::Owned,
+          },
+        },
+        napi_family_core::ResultResourceUseSite {
+          operation_id: 53,
+          path: ValuePath::new(vec![
+            napi_family_core::ValuePathSegment::Return,
+            napi_family_core::ValuePathSegment::Field("variant".to_owned()),
+            napi_family_core::ValuePathSegment::Variant("Ready".to_owned()),
+            napi_family_core::ValuePathSegment::Field("input".to_owned()),
+          ]),
+          binding: ResourceBinding {
+            kind: ResourceKind::InputStream,
+            ownership: ResourceOwnership::Owned,
+          },
+        },
+      ],
       callbacks: Vec::new(),
       streams: Vec::new(),
       stream_slot: None,
@@ -1762,6 +2096,83 @@ fn plan(family: &FamilyPlan) -> RustBridgePlan {
       },
       error_binding: ErrorBinding::Infallible,
     },
+    RustOperationPlan {
+      operation_id: id(48),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::make_nested_object),
+      },
+      receiver: None,
+      arguments: vec![RustArgumentPlan {
+        name: Ident::new("null_optional", Span::call_site()),
+        binding: ArgumentBinding::Direct {
+          carrier_type: syn::parse_quote!(u32),
+        },
+      }],
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(fixture::NestedObjectResult),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(49),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::make_nested_output),
+      },
+      receiver: None,
+      arguments: Vec::new(),
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(fixture::NestedOutputResult),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(50),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::late_nested_object),
+      },
+      receiver: None,
+      arguments: Vec::new(),
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(fixture::NestedObjectResult),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(51),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::late_nested_output),
+      },
+      receiver: None,
+      arguments: Vec::new(),
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(fixture::NestedOutputResult),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(52),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::late_nested_input),
+      },
+      receiver: None,
+      arguments: Vec::new(),
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(fixture::NestedInputResult),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
+    RustOperationPlan {
+      operation_id: id(53),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::make_nested_input),
+      },
+      receiver: None,
+      arguments: Vec::new(),
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(fixture::NestedInputResult),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
   ];
   RustBridgePlan::build_with_resource_hooks(
     family,
@@ -1888,6 +2299,30 @@ mod fixture {{
   pub struct OutputStep {{ pub kind: String }}
   #[napi(object)]
   pub struct CallbackResult {{ pub callback: u32 }}
+  #[napi(object)]
+  pub struct NestedObjectVariant {{ pub tag: String, pub object: ObjectHandle }}
+  #[napi(object, use_nullable = true)]
+  pub struct NestedObjectResult {{
+    pub optional_object: Option<ObjectHandle>,
+    pub objects: Vec<ObjectHandle>,
+    pub variant: NestedObjectVariant,
+  }}
+  #[napi(object)]
+  pub struct NestedOutputVariant {{ pub tag: String, pub output: OutputHandle }}
+  #[napi(object)]
+  pub struct NestedOutputResult {{
+    pub optional_output: Option<OutputHandle>,
+    pub outputs: Vec<OutputHandle>,
+    pub variant: NestedOutputVariant,
+  }}
+  #[napi(object)]
+  pub struct NestedInputVariant {{ pub tag: String, pub input: u32 }}
+  #[napi(object)]
+  pub struct NestedInputResult {{
+    pub optional_input: Option<u32>,
+    pub inputs: Vec<u32>,
+    pub variant: NestedInputVariant,
+  }}
   static OBJECT_RELEASES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
   static OUTPUT_CANCELS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
   static OUTPUT_RELEASES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
@@ -1918,6 +2353,52 @@ mod fixture {{
 
   pub fn answer() -> i64 {{ 42 }}
   pub async fn plus_one(value: i64) -> i64 {{ value + 1 }}
+  fn nested_object(base: u32, optional: Option<ObjectHandle>) -> NestedObjectResult {{
+    NestedObjectResult {{
+      optional_object: optional,
+      objects: vec![ObjectHandle {{ handle: base + 1 }}, ObjectHandle {{ handle: base + 2 }}],
+      variant: NestedObjectVariant {{
+        tag: "Ready".to_owned(),
+        object: ObjectHandle {{ handle: base + 4 }},
+      }},
+    }}
+  }}
+  fn nested_output(base: u32) -> NestedOutputResult {{
+    NestedOutputResult {{
+      optional_output: Some(OutputHandle {{ handle: base }}),
+      outputs: vec![OutputHandle {{ handle: base + 1 }}, OutputHandle {{ handle: base + 2 }}],
+      variant: NestedOutputVariant {{
+        tag: "Ready".to_owned(),
+        output: OutputHandle {{ handle: base + 3 }},
+      }},
+    }}
+  }}
+  fn nested_input(base: u32) -> NestedInputResult {{
+    NestedInputResult {{
+      optional_input: Some(base),
+      inputs: vec![base + 1, base + 2],
+      variant: NestedInputVariant {{ tag: "Ready".to_owned(), input: base + 3 }},
+    }}
+  }}
+  pub fn make_nested_object(null_optional: u32) -> NestedObjectResult {{
+    let base = if null_optional == 0 {{ 400 }} else {{ 410 }};
+    let optional = (null_optional == 0).then(|| ObjectHandle {{ handle: base + 3 }});
+    nested_object(base, optional)
+  }}
+  pub fn make_nested_output() -> NestedOutputResult {{ nested_output(500) }}
+  pub fn make_nested_input() -> NestedInputResult {{ nested_input(600) }}
+  pub async fn late_nested_object() -> NestedObjectResult {{
+    while !LATE_OUTPUT_RESULT_RELEASED.load(Ordering::Acquire) {{ std::thread::yield_now(); }}
+    nested_object(420, Some(ObjectHandle {{ handle: 423 }}))
+  }}
+  pub async fn late_nested_output() -> NestedOutputResult {{
+    while !LATE_OUTPUT_RESULT_RELEASED.load(Ordering::Acquire) {{ std::thread::yield_now(); }}
+    nested_output(510)
+  }}
+  pub async fn late_nested_input() -> NestedInputResult {{
+    while !LATE_OUTPUT_RESULT_RELEASED.load(Ordering::Acquire) {{ std::thread::yield_now(); }}
+    nested_input(610)
+  }}
   pub fn lower_record_value(value: Object<'static>) -> Result<RecordValue, napi_uniffi_engine::BridgeErrorDescriptor> {{
     let amount = value.get_named_property::<u32>("amount").map_err(|error| napi_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()))?;
     Ok(RecordValue {{ amount }})
@@ -2208,6 +2689,62 @@ const assertOneTeardownTimer = (before, label) => {
   assert.equal((await session.invokeAsync(47, [{ amount: 6, handle: 9999 }])).value, 9);
   assert.deepEqual(releasedCallbacks, valueReceiverObjectReleases);
   assert.deepEqual(releasedStreams, valueReceiverStreamReleases);
+  const objectReleaseCount = async (handle) => {
+    const query = addon.__uniffi_backend_factory(host);
+    const count = query.invokeSync(39, [handle]).value;
+    await query.close();
+    return count;
+  };
+  const outputCancelCount = async (handle) => {
+    const query = addon.__uniffi_backend_factory(host);
+    const count = query.invokeSync(40, [handle]).value;
+    await query.close();
+    return count;
+  };
+  const outputReleaseCount = async (handle) => {
+    const query = addon.__uniffi_backend_factory(host);
+    const count = query.invokeSync(41, [handle]).value;
+    await query.close();
+    return count;
+  };
+
+  // A single return value can contain an optional object, a record sequence,
+  // and a tagged enum payload.  The null optional must be skipped while every
+  // non-null object is retained and released exactly once.
+  const nestedObjectSession = addon.__uniffi_backend_factory(host);
+  const nestedObject = nestedObjectSession.invokeSync(48, [0]).value;
+  assert.equal(nestedObject.optionalObject.handle, 403);
+  assert.deepEqual(nestedObject.objects.map(({ handle }) => handle), [401, 402]);
+  assert.equal(nestedObject.variant.tag, 'Ready');
+  assert.equal(nestedObject.variant.object.handle, 404);
+  await nestedObjectSession.close();
+  for (const handle of [401, 402, 403, 404]) {
+    assert.equal(await objectReleaseCount(handle), 1, `nested object ${handle} released once`);
+  }
+  const nestedNullSession = addon.__uniffi_backend_factory(host);
+  const nestedNull = nestedNullSession.invokeSync(48, [1]).value;
+  assert.equal(nestedNull.optionalObject, null);
+  assert.deepEqual(nestedNull.objects.map(({ handle }) => handle), [411, 412]);
+  assert.equal(nestedNull.variant.object.handle, 414);
+  await nestedNullSession.close();
+  assert.equal(await objectReleaseCount(413), 0, 'null optional object is not released');
+  for (const handle of [411, 412, 414]) {
+    assert.equal(await objectReleaseCount(handle), 1, `nested null-object ${handle} released once`);
+  }
+
+  // Output-stream resources follow the same path fan-out and are cancelled
+  // before release, including the optional and enum branches.
+  const nestedOutputSession = addon.__uniffi_backend_factory(host);
+  const nestedOutput = nestedOutputSession.invokeSync(49, []).value;
+  assert.equal(nestedOutput.optionalOutput.handle, 500);
+  assert.deepEqual(nestedOutput.outputs.map(({ handle }) => handle), [501, 502]);
+  assert.equal(nestedOutput.variant.output.handle, 503);
+  await nestedOutputSession.close();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  for (const handle of [500, 501, 502, 503]) {
+    assert.equal(await outputCancelCount(handle), 1, `nested output ${handle} cancelled once`);
+    assert.equal(await outputReleaseCount(handle), 1, `nested output ${handle} released once`);
+  }
   session.invokeSync(17, [3]);
   await session.invokeAsync(18, [3]);
   session.invokeSync(19, [3]);
@@ -2321,6 +2858,19 @@ const assertOneTeardownTimer = (before, label) => {
   assert.deepEqual(releasedStreams, [11, 22]);
   await session.invokeAsync(16, [22]);
   assert.deepEqual(releasedStreams, [11, 22]);
+  const nestedInputSession = addon.__uniffi_backend_factory(host);
+  const nestedInput = nestedInputSession.invokeSync(53, []).value;
+  assert.equal(nestedInput.optionalInput, 600);
+  assert.deepEqual(nestedInput.inputs, [601, 602]);
+  assert.equal(nestedInput.variant.input, 603);
+  await nestedInputSession.close();
+  for (const streamId of [600, 601, 602, 603]) {
+    assert.equal(
+      releasedStreams.filter((id) => id === streamId).length,
+      1,
+      `nested input ${streamId} released once`,
+    );
+  }
   await session.invokeAsync(13, [bidi]);
   session.releaseOutputStream(bidi);
   const cancelled = (await session.invokeAsync(9, [])).value;
@@ -2532,6 +3082,70 @@ const assertOneTeardownTimer = (before, label) => {
   await drainingClose;
   assert.equal(drainingCloseSettled, true);
 
+  // These three native futures stay pending across the configured 40ms
+  // deadline.  Waking them afterwards must deliver the result Promise but
+  // must not re-enter the revoked Host; every nested resource is cleaned by
+  // the engine-owned late-result path exactly once.
+  const lateHostCalls = hostProxyCalls.slice();
+  const lateObjectController = addon.__uniffi_backend_factory(host);
+  lateObjectController.invokeSync(31, []);
+  const lateObjectSession = addon.__uniffi_backend_factory(host);
+  const lateObjectResult = lateObjectSession.invokeAsync(50, []);
+  let lateObjectClosed = false;
+  const lateObjectClose = lateObjectSession.close().then(() => { lateObjectClosed = true; });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(lateObjectClosed, true);
+  lateObjectController.invokeSync(32, []);
+  const lateObjectValue = (await lateObjectResult).value;
+  assert.equal(lateObjectValue.variant.tag, 'Ready');
+  await new Promise((resolve) => setImmediate(resolve));
+  for (const handle of [421, 422, 423, 424]) {
+    assert.equal(await objectReleaseCount(handle), 1, `late nested object ${handle} released once`);
+  }
+  assert.deepEqual(hostProxyCalls, lateHostCalls, 'late nested object never re-enters Host');
+  await lateObjectController.close();
+
+  const nestedLateOutputController = addon.__uniffi_backend_factory(host);
+  nestedLateOutputController.invokeSync(31, []);
+  const nestedLateOutputSession = addon.__uniffi_backend_factory(host);
+  const nestedLateOutputResult = nestedLateOutputSession.invokeAsync(51, []);
+  let nestedLateOutputClosed = false;
+  const nestedLateOutputClose = nestedLateOutputSession.close().then(() => { nestedLateOutputClosed = true; });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(nestedLateOutputClosed, true);
+  nestedLateOutputController.invokeSync(32, []);
+  const nestedLateOutputValue = (await nestedLateOutputResult).value;
+  assert.equal(nestedLateOutputValue.variant.tag, 'Ready');
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  for (const handle of [510, 511, 512, 513]) {
+    assert.equal(await outputCancelCount(handle), 1, `late nested output ${handle} cancelled once`);
+    assert.equal(await outputReleaseCount(handle), 1, `late nested output ${handle} released once`);
+  }
+  assert.deepEqual(hostProxyCalls, lateHostCalls, 'late nested output never re-enters Host');
+  await nestedLateOutputController.close();
+
+  const lateInputController = addon.__uniffi_backend_factory(host);
+  lateInputController.invokeSync(31, []);
+  const lateInputSession = addon.__uniffi_backend_factory(host);
+  const lateInputResult = lateInputSession.invokeAsync(52, []);
+  let lateInputClosed = false;
+  const lateInputClose = lateInputSession.close().then(() => { lateInputClosed = true; });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(lateInputClosed, true);
+  lateInputController.invokeSync(32, []);
+  const lateInputValue = (await lateInputResult).value;
+  assert.equal(lateInputValue.variant.tag, 'Ready');
+  await new Promise((resolve) => setImmediate(resolve));
+  for (const streamId of [610, 611, 612, 613]) {
+    assert.equal(
+      releasedStreams.filter((id) => id === streamId).length,
+      1,
+      `late nested input ${streamId} released once`,
+    );
+  }
+  assert.deepEqual(hostProxyCalls, lateHostCalls, 'late nested input never re-enters Host');
+  await lateInputController.close();
+
   // Every teardown uses one short Node timer.  A never-settling callback,
   // input pull and output cancel must detach at the same deadline; resolving
   // any of them afterwards cannot re-enter Host or duplicate release hooks.
@@ -2584,7 +3198,17 @@ const assertOneTeardownTimer = (before, label) => {
   await droppedInput;
   if (global.gc) global.gc();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(releasedStreams, [11, 22, 44, 44, 33]);
+  assert.deepEqual(
+    releasedStreams.filter((id) => [11, 22, 44, 33].includes(id)),
+    [11, 22, 44, 44, 33],
+  );
+  for (const streamId of [600, 601, 602, 603, 610, 611, 612, 613]) {
+    assert.equal(
+      releasedStreams.filter((id) => id === streamId).length,
+      1,
+      `nested stream ${streamId} released once`,
+    );
+  }
 })().catch(error => { console.error(error); process.exitCode = 1; })
   .finally(() => {
     global.setTimeout = originalSetTimeout;

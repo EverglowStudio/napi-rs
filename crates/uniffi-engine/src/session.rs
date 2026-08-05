@@ -618,11 +618,31 @@ pub struct SessionStreamArgument {
   pub direction: SessionStreamDirection,
 }
 
+/// Return resources are described by complete, return-rooted paths.  The
+/// session only executes this mechanical path and never needs the UniFFI type
+/// graph that produced it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionResultResourceUseSite {
+  pub path: Vec<SessionValuePathSegment>,
+  pub kind: SessionResourceReceiver,
+  pub ownership: SessionResourceOwnership,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionResourceReceiver {
   Object,
   InputStream,
   OutputStream,
+}
+
+/// Ownership carried mechanically with every generated return resource
+/// use-site. Family validation currently permits only `Owned` results, but
+/// preserving this field keeps the descriptor contract explicit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionResourceOwnership {
+  Owned,
+  Borrowed,
+  ByArc,
 }
 
 /// Session-side receiver classification.  Value receivers occupy argument
@@ -662,7 +682,7 @@ pub struct SessionOperationDescriptor {
   pub callback: Option<sys::napi_value>,
   pub native_call: SessionNativeCall,
   pub receiver: Option<SessionReceiver>,
-  pub result: Option<SessionResourceReceiver>,
+  pub result_resources: Vec<SessionResultResourceUseSite>,
   pub callback_transfer: bool,
   pub callback_arguments: Vec<SessionCallbackArgument>,
   pub stream_arguments: Vec<SessionStreamArgument>,
@@ -676,6 +696,10 @@ pub struct SessionResourceCallbacks {
 
 struct ResourceCallbacks {
   release_object: Cell<sys::napi_ref>,
+  // A direct reference to the releaseInputStream function lets a late result
+  // be cleaned up after the Host object has been revoked at deadline.  It is
+  // invoked with `undefined` as receiver and never re-enters the Host proxy.
+  release_input_stream: Cell<sys::napi_ref>,
   cancel_output_stream: Cell<sys::napi_ref>,
   release_output_stream: Cell<sys::napi_ref>,
 }
@@ -695,7 +719,7 @@ struct SessionOperation {
   callback: Cell<sys::napi_ref>,
   native_call: SessionNativeCall,
   receiver: Option<SessionReceiver>,
-  result: Option<SessionResourceReceiver>,
+  result_resources: Vec<SessionResultResourceUseSite>,
   callback_transfer: bool,
   callback_arguments: Vec<SessionCallbackArgument>,
   stream_arguments: Vec<SessionStreamArgument>,
@@ -734,6 +758,7 @@ struct SessionState {
   released_input_streams: RefCell<BTreeSet<u32>>,
   resource_references: RefCell<Vec<TrackedResource>>,
   resource_callbacks: ResourceCallbacks,
+  late_result_cleanup: Arc<LateResultCleanup>,
 }
 
 #[derive(Clone)]
@@ -1187,6 +1212,15 @@ impl SessionState {
     resource: sys::napi_value,
     kind: SessionResourceReceiver,
   ) -> Result<()> {
+    match kind {
+      SessionResourceReceiver::InputStream => {
+        let _ = stream_id(self.env, resource, "input stream resource ID")?;
+      }
+      SessionResourceReceiver::Object | SessionResourceReceiver::OutputStream => {
+        let handle = named_property(self.env, resource, "handle")?;
+        let _ = value_u32(self.env, handle, "resource handle")?;
+      }
+    }
     let already_tracked = self.resource_references.borrow().iter().any(|tracked| {
       tracked.kind == kind
         && reference_value(self.env, tracked.reference, "resource lease")
@@ -1299,14 +1333,9 @@ impl SessionState {
   fn release_late_result(
     &self,
     result: sys::napi_value,
-    kind: Option<SessionResourceReceiver>,
+    result_resources: &[SessionResultResourceUseSite],
     session_value: sys::napi_value,
   ) {
-    let Some(kind @ (SessionResourceReceiver::Object | SessionResourceReceiver::OutputStream)) =
-      kind
-    else {
-      return;
-    };
     let call_kind = match named_property(self.env, result, "kind") {
       Ok(value) => value,
       Err(_) => {
@@ -1325,10 +1354,48 @@ impl SessionState {
         return;
       }
     };
-    match kind {
-      SessionResourceReceiver::Object => self.release_untracked_resource(value, kind),
-      SessionResourceReceiver::OutputStream => self.cancel_late_output(value, session_value),
-      SessionResourceReceiver::InputStream => {}
+    let mut released = Vec::new();
+    for resource in result_resources {
+      let Ok(values) =
+        self.values_at_path_with_return(&[], 0, &resource.path, Some(value), "result resource")
+      else {
+        clear_pending_exception(self.env);
+        continue;
+      };
+      for value in values {
+        if released.iter().any(|(kind, existing)| {
+          *kind == resource.kind && strict_equals(self.env, *existing, value)
+        }) {
+          continue;
+        }
+        released.push((resource.kind, value));
+        match resource.kind {
+          SessionResourceReceiver::Object => self.release_untracked_resource(value, resource.kind),
+          SessionResourceReceiver::OutputStream => self.cancel_late_output(value, session_value),
+          SessionResourceReceiver::InputStream => {
+            if let Ok(id) = stream_id(self.env, value, "late input stream result ID") {
+              clear_pending_exception(self.env);
+              if let Ok(stream_id) = js_u32(self.env, id) {
+                clear_pending_exception(self.env);
+                if let Ok(callback) = reference_value(
+                  self.env,
+                  self.resource_callbacks.release_input_stream.get(),
+                  "late input stream release callback",
+                ) {
+                  if let Ok(receiver) = js_undefined(self.env) {
+                    if let Ok(release) = call_function(self.env, receiver, callback, &[stream_id]) {
+                      if is_thenable(self.env, release).unwrap_or(false) {
+                        let _ = self.schedule_cleanup_promise(release);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            clear_pending_exception(self.env);
+          }
+        }
+      }
     }
   }
 
@@ -1540,7 +1607,8 @@ impl SessionState {
     promise: sys::napi_value,
     session_value: sys::napi_value,
   ) -> Result<()> {
-    if !is_thenable(self.env, promise)? {
+    let thenable = is_thenable(self.env, promise)?;
+    if !thenable {
       return Ok(());
     }
     let resource_reference = {
@@ -1644,6 +1712,37 @@ impl SessionState {
     })
   }
 
+  /// Retain a session object for a settlement callback when one is
+  /// available.  Cleanup paths invoked from a finalizer intentionally pass a
+  /// null/primitive sentinel; N-API cannot create a strong reference to that
+  /// value, but the callback does not need the session object in that path.
+  fn new_settlement_ref(
+    &self,
+    session_value: sys::napi_value,
+    role: &str,
+  ) -> Result<Arc<PendingSessionRef>> {
+    if session_value.is_null() {
+      return Ok(PendingSessionRef::new(self.env, ptr::null_mut()));
+    }
+    let mut value_type = sys::ValueType::napi_undefined;
+    napi::check_status!(unsafe { sys::napi_typeof(self.env, session_value, &mut value_type) })?;
+    if !matches!(
+      value_type,
+      sys::ValueType::napi_object | sys::ValueType::napi_function
+    ) {
+      return Ok(PendingSessionRef::new(self.env, ptr::null_mut()));
+    }
+    let reference =
+      PendingSessionRef::new(self.env, create_reference(self.env, session_value, role)?);
+    if !self.gate.register_settlement_ref(reference.clone()) {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "session detached before Promise settlement registration",
+      ));
+    }
+    Ok(reference)
+  }
+
   fn new_settlement_shared(
     &self,
     snapshot: Option<InvocationSnapshot>,
@@ -1653,39 +1752,15 @@ impl SessionState {
     Arc<PendingSessionRef>,
     Arc<PendingSessionRef>,
   )> {
-    let fulfilled_reference = PendingSessionRef::new(
-      self.env,
-      create_reference(self.env, session_value, "pending session")?,
-    );
-    if !self
-      .gate
-      .register_settlement_ref(fulfilled_reference.clone())
-    {
-      return Err(Error::new(
-        Status::GenericFailure,
-        "session detached before Promise settlement registration",
-      ));
-    }
-    let rejected_reference = match create_reference(self.env, session_value, "pending session") {
-      Ok(reference) => PendingSessionRef::new(self.env, reference),
+    let fulfilled_reference = self.new_settlement_ref(session_value, "pending session")?;
+    let rejected_reference = match self.new_settlement_ref(session_value, "pending session") {
+      Ok(reference) => reference,
       Err(error) => {
         fulfilled_reference.delete();
         self.gate.unregister_settlement_ref(&fulfilled_reference);
         return Err(error);
       }
     };
-    if !self
-      .gate
-      .register_settlement_ref(rejected_reference.clone())
-    {
-      fulfilled_reference.delete();
-      self.gate.unregister_settlement_ref(&fulfilled_reference);
-      rejected_reference.delete();
-      return Err(Error::new(
-        Status::GenericFailure,
-        "session detached before Promise rejection registration",
-      ));
-    }
     let shared = Rc::new(SettlementShared {
       gate: self.gate.clone(),
       settled: Cell::new(false),
@@ -1694,6 +1769,7 @@ impl SessionState {
         fulfilled_reference.clone(),
         rejected_reference.clone(),
       ]),
+      late_result_cleanup: self.late_result_cleanup.clone(),
     });
     Ok((shared, fulfilled_reference, rejected_reference))
   }
@@ -1776,7 +1852,12 @@ impl SessionState {
         return Ok(());
       };
       tracked.cancel_pending = false;
-      self.closed.get() || tracked.release_pending
+      // close() has drained the public lease table and is waiting for this
+      // cancellation to settle before natural detach.  Once cancellation
+      // completes, the resource must move straight to its release hook even
+      // though `closed` is not set until the final close transition.
+      let release = self.closing.get() || self.closed.get() || tracked.release_pending;
+      release
     };
     if release {
       let _ = self.release_resource(resource, SessionResourceReceiver::OutputStream, false);
@@ -1792,7 +1873,7 @@ impl SessionState {
   fn track_result_value(
     &self,
     result: sys::napi_value,
-    kind: Option<SessionResourceReceiver>,
+    result_resources: &[SessionResultResourceUseSite],
     callback_arguments: &[SessionCallbackArgument],
   ) -> Result<()> {
     let call_kind = named_property(self.env, result, "kind")?;
@@ -1801,18 +1882,21 @@ impl SessionState {
     }
     let value = named_property(self.env, result, "value")?;
     self.retain_result_callbacks(callback_arguments, value)?;
-    let Some(kind) = kind else {
-      return Ok(());
-    };
-    match kind {
-      SessionResourceReceiver::InputStream => {
-        let id = stream_id(self.env, value, "input stream result ID")?;
-        if !self.released_input_streams.borrow().contains(&id) {
-          self.input_streams.borrow_mut().insert(id);
+    for resource in result_resources {
+      let values =
+        self.values_at_path_with_return(&[], 0, &resource.path, Some(value), "result resource")?;
+      for value in values {
+        match resource.kind {
+          SessionResourceReceiver::InputStream => {
+            let id = stream_id(self.env, value, "input stream result ID")?;
+            if !self.released_input_streams.borrow().contains(&id) {
+              self.input_streams.borrow_mut().insert(id);
+            }
+          }
+          SessionResourceReceiver::Object | SessionResourceReceiver::OutputStream => {
+            self.retain_resource(value, resource.kind)?;
+          }
         }
-      }
-      SessionResourceReceiver::Object | SessionResourceReceiver::OutputStream => {
-        self.retain_resource(value, kind)?;
       }
     }
     Ok(())
@@ -1825,7 +1909,7 @@ impl SessionState {
     snapshot: InvocationSnapshot,
     session_value: sys::napi_value,
   ) -> Result<sys::napi_value> {
-    let kind = operation.result;
+    let result_resources = operation.result_resources.as_slice();
     if is_thenable(self.env, result)? {
       if let Err(error) = self.begin_pending_work() {
         self.rollback(snapshot);
@@ -1833,7 +1917,7 @@ impl SessionState {
       }
       if let Err(error) = self.attach_promise_settlement(
         result,
-        kind,
+        result_resources,
         operation.callback_arguments.clone(),
         snapshot.clone(),
         session_value,
@@ -1849,8 +1933,9 @@ impl SessionState {
       // A synchronous native invocation may re-enter close() before returning.
       // Its primitive result is still delivered, but resource/callback/input
       // tracking must not create a fresh lease after teardown has begun.
-      self.release_late_result(result, kind, session_value);
-    } else if let Err(error) = self.track_result_value(result, kind, &operation.callback_arguments)
+      self.release_late_result(result, result_resources, session_value);
+    } else if let Err(error) =
+      self.track_result_value(result, result_resources, &operation.callback_arguments)
     {
       self.rollback(snapshot);
       return Err(error);
@@ -1861,7 +1946,7 @@ impl SessionState {
   fn attach_promise_settlement(
     &self,
     promise: sys::napi_value,
-    kind: Option<SessionResourceReceiver>,
+    result_resources: &[SessionResultResourceUseSite],
     callback_arguments: Vec<SessionCallbackArgument>,
     snapshot: InvocationSnapshot,
     session_value: sys::napi_value,
@@ -1871,13 +1956,13 @@ impl SessionState {
     let fulfilled_context = Box::into_raw(Box::new(AsyncResultContext {
       shared: shared.clone(),
       session_reference: fulfilled_reference,
-      kind,
+      result_resources: result_resources.to_vec(),
       callback_arguments: callback_arguments.clone(),
     }));
     let rejected_context = Box::into_raw(Box::new(AsyncResultContext {
       shared: shared.clone(),
       session_reference: rejected_reference,
-      kind: None,
+      result_resources: Vec::new(),
       callback_arguments,
     }));
     let fulfilled = create_callback_function(
@@ -2146,7 +2231,7 @@ impl SessionState {
             return Err(error);
           }
           if let Err(error) =
-            self.attach_promise_settlement(result, None, Vec::new(), snapshot.clone(), this)
+            self.attach_promise_settlement(result, &[], Vec::new(), snapshot.clone(), this)
           {
             self.finish_pending_work();
             self.rollback(snapshot);
@@ -2239,7 +2324,7 @@ impl SessionState {
     Ok(invocation_id)
   }
 
-  fn close(&self) {
+  fn close(&self, session_value: sys::napi_value) {
     if self.closing.replace(true) {
       return;
     }
@@ -2284,7 +2369,6 @@ impl SessionState {
           .map(|value| (value, tracked.kind))
       })
       .collect::<Vec<_>>();
-    let undefined = js_undefined(self.env).unwrap_or(ptr::null_mut());
     for (resource, kind) in resources {
       if kind == SessionResourceReceiver::OutputStream
         && !self.resource_callbacks.cancel_output_stream.get().is_null()
@@ -2292,8 +2376,13 @@ impl SessionState {
       {
         match self.release_resource(resource, kind, true) {
           Ok(Some(cancel)) if is_thenable(self.env, cancel).unwrap_or(false) => {
-            let _ = self.remember_cancel_promise(resource, cancel);
-            let _ = self.begin_output_cancel(resource, cancel, undefined);
+            let started = self
+              .remember_cancel_promise(resource, cancel)
+              .and_then(|_| self.begin_output_cancel(resource, cancel, session_value));
+            if started.is_err() {
+              self.forget_cancel_promise(resource);
+              let _ = self.release_resource(resource, kind, false);
+            }
           }
           Ok(_) | Err(_) => {
             let _ = self.release_resource(resource, kind, false);
@@ -2350,7 +2439,7 @@ impl SessionState {
 
   fn cleanup_references(&self) {
     if !self.closing.get() && !self.gate.detached.load(Ordering::Acquire) {
-      self.close();
+      self.close(ptr::null_mut());
     }
     if !self.gate.detached.load(Ordering::Acquire) {
       let _ = self.gate.detach();
@@ -2375,6 +2464,7 @@ impl SessionState {
     self.close_deferred.set(ptr::null_mut());
     for callback in [
       &self.resource_callbacks.release_object,
+      &self.resource_callbacks.release_input_stream,
       &self.resource_callbacks.cancel_output_stream,
       &self.resource_callbacks.release_output_stream,
     ] {
@@ -2458,24 +2548,46 @@ impl SessionState {
     let resources = std::mem::take(&mut *self.resource_references.borrow_mut());
     for tracked in resources {
       let resource = reference_value(self.env, tracked.reference, "resource lease").ok();
-      delete_reference(self.env, tracked.reference);
-      delete_reference(self.env, tracked.cancel_promise);
+      // Resolve the Promise value before deleting the state-owned reference;
+      // after detach the normal OutputCancelContext cannot re-enter state, so
+      // the independent reaction below needs this value to preserve
+      // cancel-before-release ordering.
+      let cancel_promise = if tracked.cancel_pending && !tracked.cancel_promise.is_null() {
+        reference_value(self.env, tracked.cancel_promise, "cancel promise").ok()
+      } else {
+        None
+      };
       if let Some(resource) = resource {
         match tracked.kind {
           SessionResourceReceiver::Object => {
             self.release_untracked_resource(resource, tracked.kind)
           }
-          SessionResourceReceiver::OutputStream if !tracked.cancel_pending => {
+          SessionResourceReceiver::OutputStream if tracked.cancel_pending => {
+            // The normal OutputCancelContext is tied to the lifecycle gate;
+            // after deadline detach its callback can no longer reach
+            // SessionState. Transfer the still-pending cancel Promise and
+            // resource to a gate-independent reaction before dropping the
+            // state-owned references, so cancel -> release ordering remains
+            // intact without reviving the Host.
+            let scheduled = cancel_promise
+              .and_then(|promise| self.schedule_late_output_release(promise, resource).ok())
+              .is_some();
+            if !scheduled {
+              clear_pending_exception(self.env);
+              // No usable Promise remains to order the cleanup. Avoid
+              // leaking the native lease; this fallback is only reached for
+              // an already-failed scheduling path.
+              self.release_untracked_resource(resource, tracked.kind);
+            }
+          }
+          SessionResourceReceiver::OutputStream => {
             self.release_untracked_resource(resource, tracked.kind)
           }
-          // A cancel hook that is still pending owns the output cleanup
-          // ordering.  Detach invalidates its token and deliberately drops
-          // the native reference; a late settlement cannot release twice or
-          // re-enter the Host/application.
-          SessionResourceReceiver::OutputStream => {}
           SessionResourceReceiver::InputStream => {}
         }
       }
+      delete_reference(self.env, tracked.reference);
+      delete_reference(self.env, tracked.cancel_promise);
     }
     for operation in &self.operations {
       delete_reference(self.env, operation.callback.replace(ptr::null_mut()));
@@ -2548,6 +2660,31 @@ pub fn create_backend_session(
   let session_generation = allocate_session_generation()?;
   let gate = LifecycleGate::new(env.raw());
   let host_reference = create_reference(env.raw(), host.raw(), "Host")?;
+  let requires_input_release = descriptors.iter().any(|descriptor| {
+    matches!(
+      descriptor.receiver,
+      Some(SessionReceiver::Resource(
+        SessionResourceReceiver::InputStream
+      ))
+    ) || descriptor
+      .result_resources
+      .iter()
+      .any(|resource| resource.kind == SessionResourceReceiver::InputStream)
+      || descriptor
+        .stream_arguments
+        .iter()
+        .any(|stream| stream.direction == SessionStreamDirection::Input)
+      || matches!(
+        descriptor.dispatch,
+        SessionOperationDispatch::InputStreamHostPull
+          | SessionOperationDispatch::InputStreamHostCancel
+      )
+  });
+  let release_input_stream = if requires_input_release {
+    Some(named_property(env.raw(), host.raw(), "releaseInputStream")?)
+  } else {
+    None
+  };
   let release_callback_reference = create_reference(
     env.raw(),
     named_property(env.raw(), host.raw(), "releaseCallback")?,
@@ -2555,6 +2692,16 @@ pub fn create_backend_session(
   )?;
   let mut operations = Vec::with_capacity(descriptors.len());
   for (id, descriptor) in descriptors.into_iter().enumerate() {
+    if descriptor
+      .result_resources
+      .iter()
+      .any(|resource| resource.ownership != SessionResourceOwnership::Owned)
+    {
+      return Err(Error::new(
+        Status::InvalidArg,
+        format!("result resource use-site in operation {id} must be owned"),
+      ));
+    }
     let callback = match (descriptor.dispatch, descriptor.callback) {
       (
         SessionOperationDispatch::NativeSync | SessionOperationDispatch::NativeAsync,
@@ -2579,13 +2726,36 @@ pub fn create_backend_session(
       callback: Cell::new(callback),
       native_call: descriptor.native_call,
       receiver: descriptor.receiver,
-      result: descriptor.result,
+      result_resources: descriptor.result_resources,
       callback_transfer: descriptor.callback_transfer,
       callback_arguments: descriptor.callback_arguments,
       stream_arguments: descriptor.stream_arguments,
     });
   }
 
+  let resource_callbacks = ResourceCallbacks {
+    release_object: Cell::new(optional_reference(
+      env.raw(),
+      resource_callbacks.release_object,
+      "object release callback",
+    )?),
+    release_input_stream: Cell::new(optional_reference(
+      env.raw(),
+      release_input_stream,
+      "input-stream release callback",
+    )?),
+    cancel_output_stream: Cell::new(optional_reference(
+      env.raw(),
+      resource_callbacks.cancel_output_stream,
+      "output-stream cancel callback",
+    )?),
+    release_output_stream: Cell::new(optional_reference(
+      env.raw(),
+      resource_callbacks.release_output_stream,
+      "output-stream release callback",
+    )?),
+  };
+  let late_result_cleanup = LateResultCleanup::new(env.raw(), &resource_callbacks)?;
   let state = Box::new(SessionState {
     env: env.raw(),
     gate: gate.clone(),
@@ -2618,23 +2788,8 @@ pub fn create_backend_session(
     input_streams: RefCell::new(BTreeSet::new()),
     released_input_streams: RefCell::new(BTreeSet::new()),
     resource_references: RefCell::new(Vec::new()),
-    resource_callbacks: ResourceCallbacks {
-      release_object: Cell::new(optional_reference(
-        env.raw(),
-        resource_callbacks.release_object,
-        "object release callback",
-      )?),
-      cancel_output_stream: Cell::new(optional_reference(
-        env.raw(),
-        resource_callbacks.cancel_output_stream,
-        "output-stream cancel callback",
-      )?),
-      release_output_stream: Cell::new(optional_reference(
-        env.raw(),
-        resource_callbacks.release_output_stream,
-        "output-stream release callback",
-      )?),
-    },
+    resource_callbacks,
+    late_result_cleanup,
   });
   let mut session = Object::new(env)?;
   let raw_session = session.raw();
@@ -2942,7 +3097,7 @@ unsafe extern "C" fn session_close(
   callback_result(env, || {
     let (this, _) = callback_args(env, info, 0)?;
     let state = state(env, this)?;
-    state.close();
+    state.close(this);
     state.close_promise()
   })
 }
@@ -3194,6 +3349,84 @@ fn is_null_value(env: sys::napi_env, value: sys::napi_value) -> Result<bool> {
   Ok(value_type == sys::ValueType::napi_null)
 }
 
+/// Return-path walker used after the lifecycle gate has detached.  It is
+/// deliberately independent of SessionState: only a return root is accepted
+/// and all selectors retain the same fan-out/optional semantics as the live
+/// session walker.
+fn detached_result_values(
+  env: sys::napi_env,
+  return_value: sys::napi_value,
+  path: &[SessionValuePathSegment],
+) -> Result<Vec<sys::napi_value>> {
+  let Some((SessionValuePathSegment::Return, rest)) = path.split_first() else {
+    return Err(Error::new(
+      Status::InvalidArg,
+      "late result resource path must start at return",
+    ));
+  };
+  let mut values = vec![return_value];
+  for segment in rest {
+    let mut next = Vec::new();
+    for value in values {
+      match segment {
+        SessionValuePathSegment::Field(name) => next.push(named_property(env, value, name)?),
+        SessionValuePathSegment::Variant(name) => {
+          if let Some(value) = resolve_variant(env, value, name)? {
+            next.push(value);
+          }
+        }
+        SessionValuePathSegment::Optional => {
+          if !is_null_value(env, value)? {
+            next.push(value);
+          }
+        }
+        SessionValuePathSegment::SequenceElement => {
+          let mut is_array = false;
+          napi::check_status!(unsafe { sys::napi_is_array(env, value, &mut is_array) })?;
+          if !is_array {
+            return Err(Error::new(
+              Status::InvalidArg,
+              "late result path expected an array sequence/set",
+            ));
+          }
+          let mut length = 0;
+          napi::check_status!(unsafe { sys::napi_get_array_length(env, value, &mut length) })?;
+          for index in 0..length {
+            let mut element = ptr::null_mut();
+            napi::check_status!(unsafe { sys::napi_get_element(env, value, index, &mut element) })?;
+            next.push(element);
+          }
+        }
+        SessionValuePathSegment::SetElement => {
+          next.extend(iterable_values(env, value, "values")?);
+        }
+        SessionValuePathSegment::MapKey => {
+          next.extend(
+            iterable_entries(env, value)?
+              .into_iter()
+              .map(|(key, _)| key),
+          );
+        }
+        SessionValuePathSegment::MapValue => {
+          next.extend(
+            iterable_entries(env, value)?
+              .into_iter()
+              .map(|(_, value)| value),
+          );
+        }
+        SessionValuePathSegment::Argument(_) | SessionValuePathSegment::Return => {
+          return Err(Error::new(
+            Status::InvalidArg,
+            "late result resource path contains a nested root",
+          ));
+        }
+      }
+    }
+    values = next;
+  }
+  Ok(values)
+}
+
 fn iterable_values(
   env: sys::napi_env,
   object: sys::napi_value,
@@ -3313,7 +3546,7 @@ fn resolved_promise(env: sys::napi_env) -> Result<sys::napi_value> {
 struct AsyncResultContext {
   shared: Rc<SettlementShared>,
   session_reference: Arc<PendingSessionRef>,
-  kind: Option<SessionResourceReceiver>,
+  result_resources: Vec<SessionResultResourceUseSite>,
   callback_arguments: Vec<SessionCallbackArgument>,
 }
 
@@ -3344,6 +3577,18 @@ struct LateOutputReleaseContext {
   cleanup: Arc<LateOutputRelease>,
 }
 
+/// Resource callbacks retained independently from SessionState.  A Promise
+/// may settle after the lifecycle gate detaches and destroys the State/Host
+/// references; this owner keeps only the native callback functions needed to
+/// dispose values from that late result and never keeps a revoked Host.
+struct LateResultCleanup {
+  env: sys::napi_env,
+  release_object: Option<Arc<PendingSessionRef>>,
+  release_input_stream: Option<Arc<PendingSessionRef>>,
+  cancel_output_stream: Option<Arc<PendingSessionRef>>,
+  release_output_stream: Option<Arc<PendingSessionRef>>,
+}
+
 impl Drop for LateOutputRelease {
   fn drop(&mut self) {
     // If both Promise reactions are finalized without either callback
@@ -3355,11 +3600,222 @@ impl Drop for LateOutputRelease {
   }
 }
 
+impl Drop for LateResultCleanup {
+  fn drop(&mut self) {
+    if let Some(reference) = self.release_object.as_ref() {
+      reference.delete();
+    }
+    if let Some(reference) = self.release_input_stream.as_ref() {
+      reference.delete();
+    }
+    if let Some(reference) = self.cancel_output_stream.as_ref() {
+      reference.delete();
+    }
+    if let Some(reference) = self.release_output_stream.as_ref() {
+      reference.delete();
+    }
+  }
+}
+
+impl LateResultCleanup {
+  fn clone_ref(
+    env: sys::napi_env,
+    source: sys::napi_ref,
+    role: &str,
+  ) -> Result<Option<Arc<PendingSessionRef>>> {
+    if source.is_null() {
+      return Ok(None);
+    }
+    let value = reference_value(env, source, role)?;
+    Ok(Some(PendingSessionRef::new(
+      env,
+      create_reference(env, value, role)?,
+    )))
+  }
+
+  fn new(env: sys::napi_env, callbacks: &ResourceCallbacks) -> Result<Arc<Self>> {
+    let release_object = Self::clone_ref(
+      env,
+      callbacks.release_object.get(),
+      "late object release callback",
+    )?;
+    let release_input_stream = match Self::clone_ref(
+      env,
+      callbacks.release_input_stream.get(),
+      "late input stream release callback",
+    ) {
+      Ok(value) => value,
+      Err(error) => {
+        if let Some(reference) = release_object.as_ref() {
+          reference.delete();
+        }
+        return Err(error);
+      }
+    };
+    let cancel_output_stream = match Self::clone_ref(
+      env,
+      callbacks.cancel_output_stream.get(),
+      "late output cancel callback",
+    ) {
+      Ok(value) => value,
+      Err(error) => {
+        if let Some(reference) = release_object.as_ref() {
+          reference.delete();
+        }
+        if let Some(reference) = release_input_stream.as_ref() {
+          reference.delete();
+        }
+        return Err(error);
+      }
+    };
+    let release_output_stream = match Self::clone_ref(
+      env,
+      callbacks.release_output_stream.get(),
+      "late output release callback",
+    ) {
+      Ok(value) => value,
+      Err(error) => {
+        if let Some(reference) = release_object.as_ref() {
+          reference.delete();
+        }
+        if let Some(reference) = release_input_stream.as_ref() {
+          reference.delete();
+        }
+        if let Some(reference) = cancel_output_stream.as_ref() {
+          reference.delete();
+        }
+        return Err(error);
+      }
+    };
+    Ok(Arc::new(Self {
+      env,
+      release_object,
+      release_input_stream,
+      cancel_output_stream,
+      release_output_stream,
+    }))
+  }
+
+  fn release_direct(&self, resource: sys::napi_value, callback: Option<&Arc<PendingSessionRef>>) {
+    let Some(callback) = callback else {
+      return;
+    };
+    let result = (|| {
+      let callback = reference_value(
+        self.env,
+        callback.reference.load(Ordering::Acquire),
+        "late resource callback",
+      )?;
+      let handle = named_property(self.env, resource, "handle")?;
+      call_function(self.env, resource, callback, &[handle]).map(|_| ())
+    })();
+    let _ = result;
+    clear_pending_exception(self.env);
+  }
+
+  fn release_input_stream(&self, resource: sys::napi_value) {
+    let Some(callback_ref) = self.release_input_stream.as_ref() else {
+      return;
+    };
+    let result = (|| {
+      let id = stream_id(self.env, resource, "late input stream result ID")?;
+      let id = js_u32(self.env, id)?;
+      let callback = reference_value(
+        self.env,
+        callback_ref.reference.load(Ordering::Acquire),
+        "late input stream release callback",
+      )?;
+      let receiver = js_undefined(self.env)?;
+      call_function(self.env, receiver, callback, &[id]).map(|_| ())
+    })();
+    let _ = result;
+    clear_pending_exception(self.env);
+  }
+
+  fn release_output_stream(&self, resource: sys::napi_value) {
+    self.release_direct(resource, self.release_output_stream.as_ref());
+  }
+
+  fn cancel_output_stream(&self, resource: sys::napi_value) {
+    let Some(cancel_callback) = self.cancel_output_stream.as_ref() else {
+      self.release_output_stream(resource);
+      return;
+    };
+    let cancel_result = (|| {
+      let callback = reference_value(
+        self.env,
+        cancel_callback.reference.load(Ordering::Acquire),
+        "late output cancel callback",
+      )?;
+      let handle = named_property(self.env, resource, "handle")?;
+      call_function(self.env, resource, callback, &[handle])
+    })();
+    let Ok(cancel_result) = cancel_result else {
+      clear_pending_exception(self.env);
+      self.release_output_stream(resource);
+      return;
+    };
+    clear_pending_exception(self.env);
+    if !is_thenable(self.env, cancel_result).unwrap_or(false) {
+      self.release_output_stream(resource);
+      return;
+    }
+    let Some(release_callback) = self.release_output_stream.as_ref() else {
+      return;
+    };
+    if schedule_late_output_release_with_callback(
+      self.env,
+      cancel_result,
+      resource,
+      release_callback.reference.load(Ordering::Acquire),
+    )
+    .is_err()
+    {
+      clear_pending_exception(self.env);
+      self.release_output_stream(resource);
+    }
+  }
+
+  fn dispose(&self, resource: sys::napi_value, kind: SessionResourceReceiver) {
+    match kind {
+      SessionResourceReceiver::Object => {
+        self.release_direct(resource, self.release_object.as_ref())
+      }
+      SessionResourceReceiver::InputStream => self.release_input_stream(resource),
+      SessionResourceReceiver::OutputStream => self.cancel_output_stream(resource),
+    }
+  }
+
+  fn dispose_result(
+    &self,
+    result_value: sys::napi_value,
+    result_resources: &[SessionResultResourceUseSite],
+  ) {
+    let mut released = Vec::new();
+    for use_site in result_resources {
+      let Ok(values) = detached_result_values(self.env, result_value, &use_site.path) else {
+        clear_pending_exception(self.env);
+        continue;
+      };
+      for value in values {
+        if released.iter().any(|(kind, existing)| {
+          *kind == use_site.kind && strict_equals(self.env, *existing, value)
+        }) {
+          continue;
+        }
+        released.push((use_site.kind, value));
+        self.dispose(value, use_site.kind);
+      }
+    }
+  }
+}
+
 struct SettlementShared {
   gate: Arc<LifecycleGate>,
   settled: Cell<bool>,
   snapshot: RefCell<Option<InvocationSnapshot>>,
   session_references: RefCell<Vec<Arc<PendingSessionRef>>>,
+  late_result_cleanup: Arc<LateResultCleanup>,
 }
 
 struct DeadlineContext {
@@ -3646,7 +4102,7 @@ unsafe extern "C" fn async_result_fulfilled(
           "pending session",
         )
         .unwrap_or_else(|_| js_undefined(env).unwrap_or(ptr::null_mut()));
-        state.release_late_result(args[0], context.kind, session_value);
+        state.release_late_result(args[0], &context.result_resources, session_value);
         clear_pending_exception(env);
         Ok(())
       } else {
@@ -3659,7 +4115,11 @@ unsafe extern "C" fn async_result_fulfilled(
             Ok(())
           }
           Ok(false) => {
-            match state.track_result_value(args[0], context.kind, &context.callback_arguments) {
+            match state.track_result_value(
+              args[0],
+              &context.result_resources,
+              &context.callback_arguments,
+            ) {
               Ok(()) => Ok(()),
               Err(error) => {
                 if let Some(snapshot) = context.shared.snapshot.borrow_mut().take() {
@@ -3678,6 +4138,20 @@ unsafe extern "C" fn async_result_fulfilled(
         }
       }
     } else {
+      // The gate may have detached before the Promise settled.  The Host and
+      // SessionState are intentionally gone in that case, but every resource
+      // declared by the return-path DTO still owns native cleanup.  Dispose
+      // only a successful value envelope through the independent callback
+      // owner; rejected results carry no resource payload.
+      if !call_result_is_error(env, args[0])? {
+        if let Ok(value) = named_property(env, args[0], "value") {
+          context
+            .shared
+            .late_result_cleanup
+            .dispose_result(value, &context.result_resources);
+        }
+        clear_pending_exception(env);
+      }
       Ok(())
     };
     context.shared.finish();
@@ -3828,6 +4302,85 @@ impl LateOutputRelease {
     self.release_callback.delete();
     result
   }
+}
+
+/// Schedule release of an output resource after an independent late cancel
+/// Promise.  This path owns fresh references and never consults SessionState,
+/// so it remains valid after the lifecycle gate has detached.
+fn schedule_late_output_release_with_callback(
+  env: sys::napi_env,
+  cancel_promise: sys::napi_value,
+  resource: sys::napi_value,
+  release_callback: sys::napi_ref,
+) -> Result<()> {
+  if release_callback.is_null() {
+    return Ok(());
+  }
+  let resource_ref = PendingSessionRef::new(
+    env,
+    create_reference(env, resource, "late output cleanup resource")?,
+  );
+  let release_callback_value =
+    match reference_value(env, release_callback, "output release callback") {
+      Ok(value) => value,
+      Err(error) => {
+        resource_ref.delete();
+        return Err(error);
+      }
+    };
+  let release_callback_ref =
+    match create_reference(env, release_callback_value, "late output cleanup callback") {
+      Ok(reference) => PendingSessionRef::new(env, reference),
+      Err(error) => {
+        resource_ref.delete();
+        return Err(error);
+      }
+    };
+  let cleanup = Arc::new(LateOutputRelease {
+    resource: resource_ref,
+    release_callback: release_callback_ref,
+    settled: AtomicBool::new(false),
+  });
+  let fulfilled_context = Box::into_raw(Box::new(LateOutputReleaseContext {
+    cleanup: cleanup.clone(),
+  }));
+  let rejected_context = Box::into_raw(Box::new(LateOutputReleaseContext {
+    cleanup: cleanup.clone(),
+  }));
+  let fulfilled = match create_callback_function(
+    env,
+    "uniffi_late_output_cancel_fulfilled",
+    late_output_release_fulfilled,
+    fulfilled_context.cast(),
+    Some(finalize_late_output_release_context),
+  ) {
+    Ok(value) => value,
+    Err(error) => {
+      unsafe {
+        drop(Box::from_raw(fulfilled_context));
+        drop(Box::from_raw(rejected_context));
+      }
+      return Err(error);
+    }
+  };
+  let rejected = match create_callback_function(
+    env,
+    "uniffi_late_output_cancel_rejected",
+    late_output_release_rejected,
+    rejected_context.cast(),
+    Some(finalize_late_output_release_context),
+  ) {
+    Ok(value) => value,
+    Err(error) => {
+      unsafe {
+        drop(Box::from_raw(rejected_context));
+      }
+      return Err(error);
+    }
+  };
+  let then = named_property(env, cancel_promise, "then")?;
+  call_function(env, cancel_promise, then, &[fulfilled, rejected])?;
+  Ok(())
 }
 
 unsafe extern "C" fn late_output_release_fulfilled(

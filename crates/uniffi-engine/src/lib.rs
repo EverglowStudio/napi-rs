@@ -32,7 +32,8 @@ pub use session::{
   SessionCallbackLease, SessionCallbackReentrancy, SessionCallbackRetention,
   SessionCallbackThreading, SessionCallbackTransfers, SessionNativeCall,
   SessionOperationDescriptor, SessionOperationDispatch, SessionReceiver, SessionResourceCallbacks,
-  SessionResourceReceiver, SessionStreamArgument, SessionStreamDirection, SessionValuePathSegment,
+  SessionResourceOwnership, SessionResourceReceiver, SessionResultResourceUseSite,
+  SessionStreamArgument, SessionStreamDirection, SessionValuePathSegment,
 };
 
 pub const BACKEND_FACTORY_EXPORT: &str = "__uniffi_backend_factory";
@@ -470,13 +471,19 @@ fn validate_resource_hooks(
     matches!(
       operation.receiver,
       Some(ReceiverBinding::Resource(resource)) if resource.kind == ResourceKind::Object
-    ) || operation.result.map(|resource| resource.kind) == Some(ResourceKind::Object)
+    ) || operation
+      .result_resources
+      .iter()
+      .any(|resource| resource.binding.kind == ResourceKind::Object)
   });
   let needs_output = family.operations().iter().any(|operation| {
     matches!(
       operation.receiver,
       Some(ReceiverBinding::Resource(resource)) if resource.kind == ResourceKind::OutputStream
-    ) || operation.result.map(|resource| resource.kind) == Some(ResourceKind::OutputStream)
+    ) || operation
+      .result_resources
+      .iter()
+      .any(|resource| resource.binding.kind == ResourceKind::OutputStream)
       || operation
         .streams
         .iter()
@@ -673,26 +680,49 @@ fn validate_result_resource(
   family_operation: &FamilyOperation,
   operation: &RustOperationPlan,
 ) -> Result<(), EngineError> {
-  let valid = match family_operation.result.map(|resource| resource.kind) {
-    None => !matches!(
+  let direct = family_operation
+    .result_resources
+    .iter()
+    .filter(|resource| matches!(resource.path.segments(), [ValuePathSegment::Return]))
+    .collect::<Vec<_>>();
+  if direct.len() > 1 {
+    return Err(EngineError::InvalidResourceResult {
+      operation_id: operation.operation_id,
+    });
+  }
+  let Some(direct) = direct.first() else {
+    if matches!(
+      operation.return_binding,
+      ReturnBinding::ObjectLease { .. } | ReturnBinding::OutputStreamLease { .. }
+    ) {
+      return Err(EngineError::InvalidResourceResult {
+        operation_id: operation.operation_id,
+      });
+    }
+    return Ok(());
+  };
+  let valid = match direct.binding.kind {
+    ResourceKind::Object => matches!(operation.return_binding, ReturnBinding::ObjectLease { .. }),
+    ResourceKind::OutputStream => {
+      matches!(
+        operation.return_binding,
+        ReturnBinding::OutputStreamLease { .. }
+      )
+    }
+    // Input streams use the host stream protocol and have no direct Rust
+    // lease return binding.  A return-path declaration is still retained by
+    // the session, but the Rust bridge must lower the payload normally.
+    ResourceKind::InputStream => !matches!(
       operation.return_binding,
       ReturnBinding::ObjectLease { .. } | ReturnBinding::OutputStreamLease { .. }
     ),
-    Some(ResourceKind::Object) => {
-      matches!(operation.return_binding, ReturnBinding::ObjectLease { .. })
-    }
-    Some(ResourceKind::InputStream) => false,
-    Some(ResourceKind::OutputStream) => matches!(
-      operation.return_binding,
-      ReturnBinding::OutputStreamLease { .. }
-    ),
   };
-  if valid {
-    Ok(())
-  } else {
+  if !valid {
     Err(EngineError::InvalidResourceResult {
       operation_id: operation.operation_id,
     })
+  } else {
+    Ok(())
   }
 }
 
@@ -1572,22 +1602,38 @@ fn session_descriptor(
       quote!(Some(napi_uniffi_engine::SessionReceiver::Resource(#resource)))
     }
   };
-  let result = match operation.result.map(|resource| resource.kind) {
-    None => quote!(None),
-    Some(ResourceKind::Object) => {
-      quote!(Some(napi_uniffi_engine::SessionResourceReceiver::Object))
-    }
-    Some(ResourceKind::InputStream) => {
-      quote!(Some(
-        napi_uniffi_engine::SessionResourceReceiver::InputStream
-      ))
-    }
-    Some(ResourceKind::OutputStream) => {
-      quote!(Some(
-        napi_uniffi_engine::SessionResourceReceiver::OutputStream
-      ))
-    }
-  };
+  let result_resources = operation
+    .result_resources
+    .iter()
+    .map(|use_site| {
+      let path = session_path_tokens(&use_site.path);
+      let kind = match use_site.binding.kind {
+        ResourceKind::Object => quote!(napi_uniffi_engine::SessionResourceReceiver::Object),
+        ResourceKind::InputStream => {
+          quote!(napi_uniffi_engine::SessionResourceReceiver::InputStream)
+        }
+        ResourceKind::OutputStream => {
+          quote!(napi_uniffi_engine::SessionResourceReceiver::OutputStream)
+        }
+      };
+      let ownership = match use_site.binding.ownership {
+        ResourceOwnership::Owned => {
+          quote!(napi_uniffi_engine::SessionResourceOwnership::Owned)
+        }
+        ResourceOwnership::Borrowed => {
+          quote!(napi_uniffi_engine::SessionResourceOwnership::Borrowed)
+        }
+        ResourceOwnership::ByArc => quote!(napi_uniffi_engine::SessionResourceOwnership::ByArc),
+      };
+      quote! {
+        napi_uniffi_engine::SessionResultResourceUseSite {
+          path: vec![#(#path),*],
+          kind: #kind,
+          ownership: #ownership,
+        }
+      }
+    })
+    .collect::<Vec<_>>();
   let native_call = if !operation_requires_host(rust_operation, operation) {
     quote!(napi_uniffi_engine::SessionNativeCall::ArgumentsOnly)
   } else {
@@ -1698,7 +1744,7 @@ fn session_descriptor(
       callback: #callback,
       native_call: #native_call,
       receiver: #receiver,
-      result: #result,
+      result_resources: vec![#(#result_resources),*],
       callback_transfer: #callback_transfer,
       callback_arguments: vec![#(#callback_arguments),*],
       stream_arguments: vec![#(#stream_arguments),*],
