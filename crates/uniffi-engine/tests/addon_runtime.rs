@@ -2884,19 +2884,31 @@ const assert = require('node:assert/strict');
 const originalSetTimeout = global.setTimeout;
 const originalClearTimeout = global.clearTimeout;
 const teardownTimerHandles = new Set();
+const numericTeardownTimerHandles = new Map();
 let teardownTimersCreated = 0;
 let teardownTimersCleared = 0;
+let returnNumericTeardownTimer = false;
+let nextNumericTeardownTimerHandle = 1;
 global.setTimeout = function(callback, delay, ...args) {
   const timer = originalSetTimeout.call(this, callback, delay, ...args);
   if (delay === 40) {
     teardownTimersCreated += 1;
+    if (returnNumericTeardownTimer) {
+      returnNumericTeardownTimer = false;
+      const handle = nextNumericTeardownTimerHandle++;
+      numericTeardownTimerHandles.set(handle, timer);
+      teardownTimerHandles.add(handle);
+      return handle;
+    }
     teardownTimerHandles.add(timer);
   }
   return timer;
 };
 global.clearTimeout = function(timer) {
   if (teardownTimerHandles.delete(timer)) teardownTimersCleared += 1;
-  return originalClearTimeout.call(this, timer);
+  const underlyingTimer = numericTeardownTimerHandles.get(timer) ?? timer;
+  numericTeardownTimerHandles.delete(timer);
+  return originalClearTimeout.call(this, underlyingTimer);
 };
 const timerSnapshot = () => ({ created: teardownTimersCreated, cleared: teardownTimersCleared });
 const assertOneTeardownTimer = (before, label) => {
@@ -2929,6 +2941,12 @@ const assertOneTeardownTimer = (before, label) => {
   };
   const session = addon.__uniffi_backend_factory(host);
   assert.equal(session.hostFlavor, 'node');
+  const numericTimerSession = addon.__uniffi_backend_factory(host);
+  returnNumericTeardownTimer = true;
+  const numericTimerSnapshot = timerSnapshot();
+  await numericTimerSession.close();
+  assertOneTeardownTimer(numericTimerSnapshot, 'numeric teardown timer close');
+  assert.equal(numericTeardownTimerHandles.size, 0, 'numeric teardown timer mapping cleared');
   for (const operationId of [-1, 0.5, 2 ** 32]) {
     assert.throws(() => session.invokeSync(operationId, []));
   }

@@ -2707,13 +2707,26 @@ impl SessionState {
     };
     let delay = js_u32(self.env, self.close_policy.grace_ms)?;
     let timer = call_function(self.env, global, set_timeout, &[callback, delay])?;
-    // Node timer objects expose unref(); an absent method is a backend error so
-    // a configured grace period can never accidentally keep the process alive.
+    // Node returns a timer object with unref(), while browser-compatible hosts
+    // such as Electron preload may return a numeric handle.  Every valid timer
+    // remains referenced and is passed back to clearTimeout; only callable
+    // unref properties receive the optional Node event-loop hint.
     let unref = named_property(self.env, timer, "unref")?;
-    let _ = call_function(self.env, timer, unref, &[])?;
-    self
-      .deadline_timer
-      .set(create_reference(self.env, timer, "close deadline timer")?);
+    let mut unref_type = sys::ValueType::napi_undefined;
+    // SAFETY: `self.env` and `unref` belong to the active session environment.
+    napi::check_status!(unsafe { sys::napi_typeof(self.env, unref, &mut unref_type) })?;
+    if unref_type == sys::ValueType::napi_function {
+      let _ = call_function(self.env, timer, unref, &[])?;
+    }
+    // N-API references cannot retain primitive timer handles directly.  Keep
+    // the original value in a referenced holder so clearTimeout receives the
+    // exact object or number returned by the host.
+    let timer_holder = js_array(self.env, &[timer])?;
+    self.deadline_timer.set(create_reference(
+      self.env,
+      timer_holder,
+      "close deadline timer",
+    )?);
     Ok(())
   }
 
@@ -2722,12 +2735,16 @@ impl SessionState {
     if reference.is_null() {
       return;
     }
-    if let Ok(timer) = reference_value(self.env, reference, "close deadline timer") {
-      if let Ok(global) = get_global(self.env) {
-        if let Ok(clear_timeout) = named_property(self.env, global, "clearTimeout") {
-          clear_pending_exception(self.env);
-          let _ = call_function(self.env, global, clear_timeout, &[timer]);
-          clear_pending_exception(self.env);
+    if let Ok(timer_holder) = reference_value(self.env, reference, "close deadline timer") {
+      if let Ok(mut values) = array_values(self.env, timer_holder) {
+        if let Some(timer) = values.pop() {
+          if let Ok(global) = get_global(self.env) {
+            if let Ok(clear_timeout) = named_property(self.env, global, "clearTimeout") {
+              clear_pending_exception(self.env);
+              let _ = call_function(self.env, global, clear_timeout, &[timer]);
+              clear_pending_exception(self.env);
+            }
+          }
         }
       }
     }
