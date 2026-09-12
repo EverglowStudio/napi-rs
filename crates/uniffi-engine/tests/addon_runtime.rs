@@ -1524,6 +1524,47 @@ fn family() -> FamilyPlan {
       stream_slot: None,
     },
   ]);
+  operations.push(FamilyOperationInput {
+    id: 59,
+    kind: OperationKind::Function,
+    async_kind: AsyncKind::Sync,
+    fallible: false,
+    argument_count: 1,
+    dispatch: OperationDispatch::Native,
+    receiver: None,
+    result_resources: [
+      ("object", ResourceKind::Object),
+      ("output", ResourceKind::OutputStream),
+    ]
+    .into_iter()
+    .map(|(field, kind)| napi_family_core::ResultResourceUseSite {
+      operation_id: 59,
+      path: ValuePath::new(vec![
+        napi_family_core::ValuePathSegment::Return,
+        napi_family_core::ValuePathSegment::Field(field.to_owned()),
+      ]),
+      binding: ResourceBinding {
+        kind,
+        ownership: ResourceOwnership::Owned,
+      },
+    })
+    .collect(),
+    callbacks: vec![CallbackUseSite {
+      operation_id: 59,
+      callback_type_id: 0,
+      path: ValuePath::new(vec![
+        napi_family_core::ValuePathSegment::Return,
+        napi_family_core::ValuePathSegment::Field("callback".to_owned()),
+      ]),
+      contract: CallbackContract {
+        retention: CallbackRetention::Retained,
+        threading: CallbackThreading::CallingThread,
+        reentrancy: CallbackReentrancy::Allowed,
+      },
+    }],
+    streams: vec![],
+    stream_slot: None,
+  });
   operations[5].receiver = Some(ReceiverBinding::Resource(ResourceBinding {
     kind: ResourceKind::InputStream,
     ownership: ResourceOwnership::Borrowed,
@@ -2392,6 +2433,23 @@ fn plan(family: &FamilyPlan) -> RustBridgePlan {
       },
       error_binding: ErrorBinding::Infallible,
     },
+    RustOperationPlan {
+      operation_id: id(59),
+      target: RustOperationTarget::Native {
+        call: syn::parse_quote!(fixture::make_resource_bundle),
+      },
+      receiver: None,
+      arguments: vec![RustArgumentPlan {
+        name: Ident::new("base", Span::call_site()),
+        binding: ArgumentBinding::Direct {
+          carrier_type: syn::parse_quote!(u32),
+        },
+      }],
+      return_binding: ReturnBinding::Direct {
+        carrier_type: syn::parse_quote!(fixture::ResourceBundle),
+      },
+      error_binding: ErrorBinding::Infallible,
+    },
   ];
   RustBridgePlan::build_with_resource_hooks(
     family,
@@ -2523,6 +2581,11 @@ mod fixture {{
   #[napi(object)]
   pub struct CallbackResult {{ pub callback: u32 }}
   #[napi(object)]
+  pub struct ResourceBundle {{ pub object: ObjectHandle, pub output: OutputHandle, pub callback: u32 }}
+  pub fn make_resource_bundle(base: u32) -> ResourceBundle {{
+    ResourceBundle {{ object: ObjectHandle {{ handle: base + 10000 }}, output: OutputHandle {{ handle: base + 20000 }}, callback: base + 30000 }}
+  }}
+  #[napi(object)]
   pub struct NestedObjectVariant {{ pub tag: String, pub object: ObjectHandle }}
   #[napi(object, use_nullable = true)]
   pub struct NestedObjectResult {{
@@ -2553,6 +2616,7 @@ mod fixture {{
   static OUTPUT_RELEASES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
   static NESTED_CALLBACK_HOLDS: Mutex<Vec<napi_uniffi_engine::SessionCallbackLease>> = Mutex::new(Vec::new());
   static DIRECT_CALLBACK_HOLDS: Mutex<Vec<CallbackProxy>> = Mutex::new(Vec::new());
+  static NEXT_OBJECT: AtomicU32 = AtomicU32::new(77);
   static NEXT_OUTPUT: AtomicU32 = AtomicU32::new(101);
   static NEXT_STREAM_OBJECT: AtomicU32 = AtomicU32::new(1001);
   static CANCEL_GATE_ARMED: AtomicBool = AtomicBool::new(false);
@@ -2765,7 +2829,7 @@ mod fixture {{
   pub fn output_cancel_count(handle: u32) -> u32 {{ OUTPUT_CANCELS.lock().unwrap().iter().filter(|value| **value == handle).count() as u32 }}
   pub fn output_release_count(handle: u32) -> u32 {{ OUTPUT_RELEASES.lock().unwrap().iter().filter(|value| **value == handle).count() as u32 }}
   pub fn consume_input(stream_id: u32) -> u32 {{ stream_id }}
-  pub fn make_object() -> u32 {{ 77 }}
+  pub fn make_object() -> u32 {{ NEXT_OBJECT.fetch_add(1, Ordering::Relaxed) }}
   pub fn lift_object(handle: u32) -> Result<ObjectHandle, napi_uniffi_engine::BridgeErrorDescriptor> {{ Ok(ObjectHandle {{ handle }}) }}
   pub fn fail_object() -> Result<u32, napi_uniffi_engine::BridgeErrorDescriptor> {{ Err(napi_uniffi_engine::BridgeErrorDescriptor::backend("object failure")) }}
   pub fn map_error(error: napi_uniffi_engine::BridgeErrorDescriptor) -> napi_uniffi_engine::BridgeErrorDescriptor {{ error }}
@@ -3378,12 +3442,18 @@ const assertOneTeardownTimer = (before, label) => {
   const fallibleErrorController = addon.__uniffi_backend_factory(host);
   fallibleErrorController.invokeSync(36, []);
   const fallibleErrorSession = addon.__uniffi_backend_factory(host);
+  const failedLeaseReleases = releasedCallbacks.filter(([type, id]) => type === 0 && id === 608).length;
   const fallibleErrorResult = fallibleErrorSession.invokeAsync(42, [608]);
+  const concurrentSuccess = fallibleErrorSession.invokeSync(7, []).value;
+  const concurrentSuccessReleases = await objectReleaseCount(concurrentSuccess.handle);
   fallibleErrorController.invokeSync(37, []);
   const fallibleErrorEnvelope = await fallibleErrorResult;
   assert.equal(fallibleErrorEnvelope.kind, 'error');
   assert.equal(fallibleErrorEnvelope.error.message, 'fallible Host fixture error');
+  assert.equal(releasedCallbacks.filter(([type, id]) => type === 0 && id === 608).length, failedLeaseReleases + 1, 'failed invocation releases its own retained callback');
+  assert.equal(await objectReleaseCount(concurrentSuccess.handle), concurrentSuccessReleases, 'a retained native callback failure preserves the later object');
   await fallibleErrorSession.close();
+  assert.equal(await objectReleaseCount(concurrentSuccess.handle), concurrentSuccessReleases + 1);
   fallibleErrorController.invokeSync(38, []);
   await fallibleErrorController.close();
 
@@ -3575,6 +3645,128 @@ const assertOneTeardownTimer = (before, label) => {
   }
   assert.equal(closedReturnedEnvelope.kind, 'error');
   assert.deepEqual(retained, retainedBeforeClosedReturn);
+
+  // 一个调用失败时，后来成功登记的对象、流与 callback 仍属于各自调用。
+  // 使用可控 Host Promise 固定顺序，避免依靠线程调度概率复现。
+  for (const outcome of ['error', 'rejection']) {
+    let settle;
+    let reject;
+    const concurrent = addon.__uniffi_backend_factory({
+      ...host,
+      invokeCallbackAsync() { return new Promise((resolve, fail) => { settle = resolve; reject = fail; }); },
+    });
+    const id = outcome === 'error' ? 7301 : 7302;
+    const callbackId = id + 100;
+    let object;
+    let objectBefore;
+    const streamsBefore = releasedStreams.filter(value => value === id).length;
+    const callbacksBefore = releasedCallbacks.filter(([type, value]) => type === 0 && value === callbackId).length;
+    let output;
+    let outputBefore;
+    const pendingFailure = concurrent.invokeAsync(2, [9001]);
+    const observedFailure = pendingFailure.then(value => ({ value }), error => ({ error }));
+    try {
+      object = concurrent.invokeSync(7, []).value;
+      objectBefore = await objectReleaseCount(object.handle);
+      concurrent.invokeSync(4, [id]);
+      concurrent.invokeSync(55, [callbackId]);
+      output = (await concurrent.invokeAsync(9, [])).value;
+      outputBefore = await outputReleaseCount(output.handle);
+      if (outcome === 'error') settle({ kind: 'error', error: { message: 'expected failure' } });
+      else reject(new Error('expected rejection'));
+      const failure = await observedFailure;
+      if (outcome === 'error') assert.equal(failure.value.kind, 'error');
+      else assert.match(failure.error.message, /expected rejection/);
+      assert.equal(await objectReleaseCount(object.handle), objectBefore, `${outcome}: unrelated object remains owned`);
+      assert.equal(await outputReleaseCount(output.handle), outputBefore, `${outcome}: unrelated output remains owned`);
+      assert.equal(releasedStreams.filter(value => value === id).length, streamsBefore);
+      assert.equal(releasedCallbacks.filter(([type, value]) => type === 0 && value === callbackId).length, callbacksBefore);
+      assert.equal(concurrent.invokeSync(0, []).value, 42n);
+    } finally {
+      // 即使旧版本断言失败，也结束挂起 Promise 和实际 Session。
+      settle({ kind: 'value', value: 0 });
+      await observedFailure;
+      await concurrent.close();
+    }
+    assert.equal(await objectReleaseCount(object.handle), objectBefore + 1, 'close releases the object once');
+    assert.equal(await outputReleaseCount(output.handle), outputBefore + 1, 'close releases output once');
+    assert.equal(releasedStreams.filter(value => value === id).length, streamsBefore + 1);
+    assert.equal(releasedCallbacks.filter(([type, value]) => type === 0 && value === callbackId).length, callbacksBefore + 1);
+  }
+
+  // 同步 retain 钩子重入成功调用后抛错，也只能回滚外层自己的 lease。
+  let nestedSession;
+  let reentrantCreatedObject;
+  const outerCallbackId = 7501;
+  const nestedCallbackId = 7502;
+  const nestedInputId = 7503;
+  const outerReleases = releasedCallbacks.filter(([type, id]) => type === 0 && id === outerCallbackId).length;
+  nestedSession = addon.__uniffi_backend_factory({
+    ...host,
+    retainCallback(type, id) {
+      host.retainCallback(type, id);
+      if (id === outerCallbackId) {
+        reentrantCreatedObject = nestedSession.invokeSync(7, []).value;
+        nestedSession.invokeSync(4, [nestedInputId]);
+        nestedSession.invokeSync(55, [nestedCallbackId]);
+        throw new Error('outer retain failed after nested success');
+      }
+    },
+  });
+  try {
+    assert.throws(() => nestedSession.invokeSync(3, [{ event: { tag: 'Ready', callback: outerCallbackId } }]));
+    assert.equal(await objectReleaseCount(reentrantCreatedObject.handle), 0);
+    assert.equal(releasedStreams.filter(id => id === nestedInputId).length, 0);
+    assert.equal(releasedCallbacks.filter(([type, id]) => type === 0 && id === nestedCallbackId).length, 0);
+    assert.equal(releasedCallbacks.filter(([type, id]) => type === 0 && id === outerCallbackId).length, outerReleases + 1);
+  } finally {
+    await nestedSession.close();
+  }
+  assert.equal(await objectReleaseCount(reentrantCreatedObject.handle), 1);
+  assert.equal(releasedStreams.filter(id => id === nestedInputId).length, 1);
+  assert.equal(releasedCallbacks.filter(([type, id]) => type === 0 && id === nestedCallbackId).length, 1);
+  assert.equal(releasedCallbacks.filter(([type, id]) => type === 0 && id === outerCallbackId).length, outerReleases + 1);
+
+  // 合法 record 的 callback 保留失败时，整个返回值的 owned 对象与流都必须被收回。
+  for (const gated of [false, true]) {
+    const base = gated ? 7601 : 7600;
+    const controller = addon.__uniffi_backend_factory(host);
+    let failedResult;
+    let unrelated;
+    failedResult = addon.__uniffi_backend_factory({
+      ...host,
+      retainCallback(type, id) {
+        host.retainCallback(type, id);
+        if (id === base + 30000) {
+          unrelated = failedResult.invokeSync(7, []).value;
+          throw new Error('result callback retain failed');
+        }
+      },
+    });
+    try {
+      if (gated) controller.invokeSync(23, []);
+      assert.throws(() => failedResult.invokeSync(59, [base]));
+      assert.equal(await objectReleaseCount(unrelated.handle), 0, 'reentrant successful result stays owned');
+      assert.equal(await objectReleaseCount(base + 10000), 1, 'undelivered owned object is released');
+      let closed = false;
+      const closing = failedResult.close().then(() => { closed = true; });
+      if (gated) {
+        await Promise.resolve();
+        assert.equal(closed, false, 'close waits for failed-result output cancellation');
+        assert.equal(await outputReleaseCount(base + 20000), 0);
+        controller.invokeSync(24, []);
+      }
+      await closing;
+      assert.equal(await objectReleaseCount(unrelated.handle), 1);
+      assert.equal(await outputCancelCount(base + 20000), 1, 'undelivered output is cancelled once');
+      assert.equal(await outputReleaseCount(base + 20000), 1, 'undelivered output is released once after cancel');
+      assert.equal(releasedCallbacks.filter(([type, id]) => type === 0 && id === base + 30000).length, 1);
+    } finally {
+      if (gated) controller.invokeSync(24, []);
+      await failedResult.close();
+      await controller.close();
+    }
+  }
 
   let droppedSession = addon.__uniffi_backend_factory(host);
   const droppedOutput = droppedSession.invokeAsync(9, []);

@@ -399,10 +399,13 @@ impl SessionCallbackInvoker {
     // `new_callback_lease` repeats the gate check around the Host hook for a
     // close/reentrancy race.
     let state = unsafe { &*state };
-    state.new_callback_lease(CallbackKey {
-      callback_type_id,
-      callback_id,
-    })
+    state.new_callback_lease(
+      CallbackKey {
+        callback_type_id,
+        callback_id,
+      },
+      None,
+    )
   }
 
   /// Allocate a session-local asynchronous callback invocation ID.
@@ -900,6 +903,7 @@ struct ResourceCallbacks {
 }
 
 struct TrackedResource {
+  identity: Rc<()>,
   reference: sys::napi_ref,
   kind: SessionResourceReceiver,
   cancel_called: bool,
@@ -956,13 +960,14 @@ struct SessionState {
   late_result_cleanup: Arc<LateResultCleanup>,
 }
 
-#[derive(Clone)]
-struct InvocationSnapshot {
-  callback_len: usize,
-  callback_owner_len: usize,
-  callback_transfer_len: usize,
-  streams: BTreeSet<u32>,
-  resource_len: usize,
+/// 单次调用实际登记的资源。跨 await 和同步 Host 重入都不能用全会话长度回滚。
+/// 弱 callback 身份及 Rc 身份令牌不拥有原生资源，但在登记存活期间防止地址复用。
+#[derive(Clone, Default)]
+struct InvocationResources {
+  callbacks: Vec<Weak<CallbackLeaseInner>>,
+  transfers: Vec<u32>,
+  streams: Vec<u32>,
+  resources: Vec<Rc<()>>,
 }
 
 struct RetainedInvocation {
@@ -1031,99 +1036,84 @@ impl SessionState {
     self.close_deferred.set(ptr::null_mut());
   }
 
-  fn snapshot(&self) -> InvocationSnapshot {
-    InvocationSnapshot {
-      callback_len: self.callback_leases.borrow().len(),
-      callback_owner_len: self.callback_owners.borrow().len(),
-      callback_transfer_len: self.callback_transfers.borrow().len(),
-      streams: self.input_streams.borrow().clone(),
-      resource_len: self.resource_references.borrow().len(),
-    }
-  }
-
-  fn rollback(&self, snapshot: InvocationSnapshot) {
-    let callbacks = {
-      let mut current = self.callback_leases.borrow_mut();
-      if current.len() <= snapshot.callback_len {
-        Vec::new()
-      } else {
-        current.split_off(snapshot.callback_len)
-      }
+  fn rollback(&self, invocation: InvocationResources) {
+    // 先按本次调用的精确身份撤销登记，用户释放钩子可重入并登记其他调用的资源。
+    let owns_callback = |callback: &Weak<CallbackLeaseInner>| {
+      invocation
+        .callbacks
+        .iter()
+        .any(|owned| owned.ptr_eq(callback))
     };
-    for callback in callbacks {
+    for callback in &invocation.callbacks {
       if let Some(callback) = callback.upgrade() {
         callback.release();
       }
     }
-    let owners = {
-      let mut current = self.callback_owners.borrow_mut();
-      if current.len() <= snapshot.callback_owner_len {
-        Vec::new()
-      } else {
-        current.split_off(snapshot.callback_owner_len)
-      }
-    };
-    for owner in owners {
-      owner.inner.release();
-    }
-    let transfers = {
-      let mut current = self.callback_transfers.borrow_mut();
-      if current.len() <= snapshot.callback_transfer_len {
-        Vec::new()
-      } else {
-        current.split_off(snapshot.callback_transfer_len)
-      }
-    };
-    for transfer_id in transfers {
-      discard_callback_transfer(self.session_generation, transfer_id);
+    self
+      .callback_leases
+      .borrow_mut()
+      .retain(|callback| !owns_callback(callback));
+    self
+      .callback_owners
+      .borrow_mut()
+      .retain(|owner| !owns_callback(&Arc::downgrade(&owner.inner)));
+    self
+      .callback_transfers
+      .borrow_mut()
+      .retain(|id| !invocation.transfers.contains(id));
+    for id in invocation.transfers {
+      discard_callback_transfer(self.session_generation, id);
     }
     self.drain_callback_releases();
-    let streams = {
-      let mut current = self.input_streams.borrow_mut();
-      let added = current
-        .difference(&snapshot.streams)
-        .copied()
-        .collect::<Vec<_>>();
-      for id in &added {
-        current.remove(id);
-      }
-      self
-        .released_input_streams
-        .borrow_mut()
-        .extend(added.iter().copied());
-      added
-    };
-    for id in streams {
-      if let Ok(value) = js_u32(self.env, id) {
-        clear_pending_exception(self.env);
-        let _ = self.call_host("releaseInputStream", &[value]);
-      }
+    for id in invocation.streams {
+      clear_pending_exception(self.env);
+      let _ = self.release_input_stream(id);
     }
-    loop {
-      let Some((resource, kind, reference)) = ({
+    for identity in invocation.resources.into_iter().rev() {
+      let tracked = {
         let references = self.resource_references.borrow();
-        if references.len() <= snapshot.resource_len {
-          None
-        } else {
-          let tracked = references.last().expect("resource length checked");
-          Some((
-            reference_value(self.env, tracked.reference, "resource lease").ok(),
-            tracked.kind,
-            tracked.reference,
-          ))
-        }
-      }) else {
-        break;
+        references
+          .iter()
+          .find(|tracked| Rc::ptr_eq(&tracked.identity, &identity))
+          .map(|tracked| {
+            (
+              reference_value(self.env, tracked.reference, "resource lease").ok(),
+              tracked.kind,
+            )
+          })
+      };
+      let Some((resource, kind)) = tracked else {
+        continue;
       };
       if let Some(resource) = resource {
-        let _ = self.release_resource(resource, kind, false);
+        if kind == SessionResourceReceiver::OutputStream && self.output_cancel_is_new(resource) {
+          // 返回值没有交给调用者：取消生产者后才能释放输出句柄。
+          self.cancel_tracked_output(resource, ptr::null_mut());
+        } else {
+          // 已有 cancel 由其 settlement 完成后释放，不重复挂接清理或循环强制清空。
+          let _ = self.release_resource(resource, kind, false);
+        }
       } else {
-        let mut references = self.resource_references.borrow_mut();
-        if references.len() > snapshot.resource_len {
-          references.pop();
-          delete_reference(self.env, reference);
+        let removed = {
+          let mut references = self.resource_references.borrow_mut();
+          references
+            .iter()
+            .position(|tracked| Rc::ptr_eq(&tracked.identity, &identity))
+            .map(|index| references.swap_remove(index))
+        };
+        if let Some(tracked) = removed {
+          delete_reference(self.env, tracked.reference);
+          delete_reference(self.env, tracked.cancel_promise);
         }
       }
+    }
+  }
+
+  fn retain_input_stream(&self, id: u32, invocation: &mut InvocationResources) {
+    if !self.released_input_streams.borrow().contains(&id)
+      && self.input_streams.borrow_mut().insert(id)
+    {
+      invocation.streams.push(id);
     }
   }
 
@@ -1272,7 +1262,11 @@ impl SessionState {
     Ok(values)
   }
 
-  fn new_callback_lease(&self, key: CallbackKey) -> Result<SessionCallbackLease> {
+  fn new_callback_lease(
+    &self,
+    key: CallbackKey,
+    invocation: Option<&mut InvocationResources>,
+  ) -> Result<SessionCallbackLease> {
     // Every new retain originates on the owning JS thread.  Keep this guard
     // here as well as on the public returned-callback API so argument/result
     // paths cannot accidentally create a lease after close has revoked the
@@ -1296,10 +1290,11 @@ impl SessionState {
       queue: self.callback_release_queue.clone(),
     });
     let lease = SessionCallbackLease { inner };
-    self
-      .callback_leases
-      .borrow_mut()
-      .push(Arc::downgrade(&lease.inner));
+    let identity = Arc::downgrade(&lease.inner);
+    self.callback_leases.borrow_mut().push(identity.clone());
+    if let Some(invocation) = invocation {
+      invocation.callbacks.push(identity);
+    }
     if let Err(error) = self.call_host("retainCallback", &[callback_type, callback_id]) {
       // A host retain hook may have side effects before reporting an error;
       // claim the pre-registered token so the attempted retain is balanced.
@@ -1321,6 +1316,7 @@ impl SessionState {
     &self,
     callback_arguments: &[SessionCallbackArgument],
     result_value: sys::napi_value,
+    invocation: &mut InvocationResources,
   ) -> Result<()> {
     for callback in callback_arguments {
       if !matches!(callback.path.first(), Some(SessionValuePathSegment::Return)) {
@@ -1342,7 +1338,7 @@ impl SessionState {
           callback_type_id: callback.callback_type_id,
           callback_id,
         };
-        let lease = self.new_callback_lease(key)?;
+        let lease = self.new_callback_lease(key, Some(&mut *invocation))?;
         self.callback_owners.borrow_mut().push(lease);
       }
     }
@@ -1353,6 +1349,7 @@ impl SessionState {
     &self,
     operation: &SessionOperation,
     args: &[sys::napi_value],
+    invocation: &mut InvocationResources,
   ) -> Result<RetainedInvocation> {
     let mut use_site_leases = Vec::with_capacity(operation.callback_arguments.len());
     let receiver_offset = usize::from(operation.receiver.is_some());
@@ -1376,7 +1373,7 @@ impl SessionState {
             callback_type_id: callback.callback_type_id,
             callback_id,
           };
-          leases.push(self.new_callback_lease(key)?);
+          leases.push(self.new_callback_lease(key, Some(&mut *invocation))?);
         }
       }
       use_site_leases.push(leases);
@@ -1388,9 +1385,7 @@ impl SessionState {
       let values = self.values_at_path(args, receiver_offset, &stream.path, "input stream")?;
       for value in values {
         let id = stream_id(self.env, value, "input stream ID")?;
-        if !self.released_input_streams.borrow().contains(&id) {
-          self.input_streams.borrow_mut().insert(id);
-        }
+        self.retain_input_stream(id, invocation);
       }
     }
     if let Some(SessionReceiver::Resource(receiver)) = operation.receiver {
@@ -1400,12 +1395,10 @@ impl SessionState {
       match receiver {
         SessionResourceReceiver::InputStream => {
           let id = stream_id(self.env, resource, "input stream ID")?;
-          if !self.released_input_streams.borrow().contains(&id) {
-            self.input_streams.borrow_mut().insert(id);
-          }
+          self.retain_input_stream(id, invocation);
         }
         SessionResourceReceiver::Object | SessionResourceReceiver::OutputStream => {
-          self.retain_resource(resource, receiver)?;
+          self.retain_resource(resource, receiver, invocation)?;
         }
       }
     }
@@ -1420,6 +1413,7 @@ impl SessionState {
         },
       );
       self.callback_transfers.borrow_mut().push(transfer_id);
+      invocation.transfers.push(transfer_id);
       Some(transfer_id)
     } else {
       None
@@ -1431,6 +1425,7 @@ impl SessionState {
     &self,
     resource: sys::napi_value,
     kind: SessionResourceReceiver,
+    invocation: &mut InvocationResources,
   ) -> Result<()> {
     match kind {
       SessionResourceReceiver::InputStream => {
@@ -1448,8 +1443,12 @@ impl SessionState {
           .is_some_and(|existing| strict_equals(self.env, existing, resource))
     });
     if !already_tracked {
+      let reference = create_reference(self.env, resource, "resource lease")?;
+      let identity = Rc::new(());
+      invocation.resources.push(identity.clone());
       self.resource_references.borrow_mut().push(TrackedResource {
-        reference: create_reference(self.env, resource, "resource lease")?,
+        identity,
+        reference,
         kind,
         cancel_called: false,
         cancel_pending: false,
@@ -1656,6 +1655,7 @@ impl SessionState {
       }
     };
     self.resource_references.borrow_mut().push(TrackedResource {
+      identity: Rc::new(()),
       reference,
       kind: SessionResourceReceiver::OutputStream,
       cancel_called: false,
@@ -1664,6 +1664,22 @@ impl SessionState {
       release_called: false,
       release_pending: false,
     });
+    self.cancel_tracked_output(resource, session_value);
+  }
+
+  fn cancel_tracked_output(&self, resource: sys::napi_value, session_value: sys::napi_value) {
+    // 迟到结果与失败结果都没有外部所有者，取消完成后必须进入 release。
+    // 先登记意图，随后才调用可能重入的取消钩子。
+    for tracked in self.resource_references.borrow_mut().iter_mut() {
+      if tracked.kind == SessionResourceReceiver::OutputStream
+        && reference_value(self.env, tracked.reference, "resource lease")
+          .ok()
+          .is_some_and(|value| strict_equals(self.env, value, resource))
+      {
+        tracked.release_pending = true;
+        break;
+      }
+    }
     let cancel_result =
       match self.release_resource(resource, SessionResourceReceiver::OutputStream, true) {
         Ok(Some(result)) => Some(result),
@@ -1965,7 +1981,7 @@ impl SessionState {
 
   fn new_settlement_shared(
     &self,
-    snapshot: Option<InvocationSnapshot>,
+    invocation: Option<InvocationResources>,
     session_value: sys::napi_value,
   ) -> Result<(
     Rc<SettlementShared>,
@@ -1984,7 +2000,7 @@ impl SessionState {
     let shared = Rc::new(SettlementShared {
       gate: self.gate.clone(),
       settled: Cell::new(false),
-      snapshot: RefCell::new(snapshot),
+      invocation: RefCell::new(invocation),
       session_references: RefCell::new(vec![
         fulfilled_reference.clone(),
         rejected_reference.clone(),
@@ -2095,13 +2111,15 @@ impl SessionState {
     result: sys::napi_value,
     result_resources: &[SessionResultResourceUseSite],
     callback_arguments: &[SessionCallbackArgument],
+    invocation: &mut InvocationResources,
   ) -> Result<()> {
     let call_kind = named_property(self.env, result, "kind")?;
     if string_value(self.env, call_kind)?.as_deref() != Some("value") {
       return Ok(());
     }
     let value = named_property(self.env, result, "value")?;
-    self.retain_result_callbacks(callback_arguments, value)?;
+    // 合法返回值的 owned 资源先进入本调用清单，再进入用户 callback 保留钩子。
+    // 钩子抛错或重入关闭时，回滚/关闭仍能找到完整的对象和输出流。
     for resource in result_resources {
       let values =
         self.values_at_path_with_return(&[], 0, &resource.path, Some(value), "result resource")?;
@@ -2109,16 +2127,15 @@ impl SessionState {
         match resource.kind {
           SessionResourceReceiver::InputStream => {
             let id = stream_id(self.env, value, "input stream result ID")?;
-            if !self.released_input_streams.borrow().contains(&id) {
-              self.input_streams.borrow_mut().insert(id);
-            }
+            self.retain_input_stream(id, invocation);
           }
           SessionResourceReceiver::Object | SessionResourceReceiver::OutputStream => {
-            self.retain_resource(value, resource.kind)?;
+            self.retain_resource(value, resource.kind, invocation)?;
           }
         }
       }
     }
+    self.retain_result_callbacks(callback_arguments, value, invocation)?;
     Ok(())
   }
 
@@ -2126,38 +2143,53 @@ impl SessionState {
     &self,
     result: sys::napi_value,
     operation: &SessionOperation,
-    snapshot: InvocationSnapshot,
+    mut invocation: InvocationResources,
     session_value: sys::napi_value,
   ) -> Result<sys::napi_value> {
     let result_resources = operation.result_resources.as_slice();
-    if is_thenable(self.env, result)? {
+    if match is_thenable(self.env, result) {
+      Ok(value) => value,
+      Err(error) => {
+        self.rollback(invocation);
+        return Err(error);
+      }
+    } {
       if let Err(error) = self.begin_pending_work() {
-        self.rollback(snapshot);
+        self.rollback(invocation);
         return Err(error);
       }
       if let Err(error) = self.attach_promise_settlement(
         result,
         result_resources,
         operation.callback_arguments.clone(),
-        snapshot.clone(),
+        invocation.clone(),
         session_value,
       ) {
         self.finish_pending_work();
-        self.rollback(snapshot);
+        self.rollback(invocation);
         return Err(error);
       }
-    } else if call_result_is_error(self.env, result)? {
-      self.rollback(snapshot);
+    } else if match call_result_is_error(self.env, result) {
+      Ok(value) => value,
+      Err(error) => {
+        self.rollback(invocation);
+        return Err(error);
+      }
+    } {
+      self.rollback(invocation);
     } else if self.closing.get() || self.closed.get() || self.gate.detached.load(Ordering::Acquire)
     {
       // A synchronous native invocation may re-enter close() before returning.
       // Its primitive result is still delivered, but resource/callback/input
       // tracking must not create a fresh lease after teardown has begun.
       self.release_late_result(result, result_resources, session_value);
-    } else if let Err(error) =
-      self.track_result_value(result, result_resources, &operation.callback_arguments)
-    {
-      self.rollback(snapshot);
+    } else if let Err(error) = self.track_result_value(
+      result,
+      result_resources,
+      &operation.callback_arguments,
+      &mut invocation,
+    ) {
+      self.rollback(invocation);
       return Err(error);
     }
     Ok(result)
@@ -2168,11 +2200,11 @@ impl SessionState {
     promise: sys::napi_value,
     result_resources: &[SessionResultResourceUseSite],
     callback_arguments: Vec<SessionCallbackArgument>,
-    snapshot: InvocationSnapshot,
+    invocation: InvocationResources,
     session_value: sys::napi_value,
   ) -> Result<()> {
     let (shared, fulfilled_reference, rejected_reference) =
-      self.new_settlement_shared(Some(snapshot), session_value)?;
+      self.new_settlement_shared(Some(invocation), session_value)?;
     let fulfilled_context = Box::into_raw(Box::new(AsyncResultContext {
       shared: shared.clone(),
       session_reference: fulfilled_reference,
@@ -2194,7 +2226,7 @@ impl SessionState {
     )
     .map_err(|error| {
       shared.settled.set(true);
-      shared.snapshot.borrow_mut().take();
+      shared.invocation.borrow_mut().take();
       unsafe {
         let fulfilled = Box::from_raw(fulfilled_context);
         let rejected = Box::from_raw(rejected_context);
@@ -2212,7 +2244,7 @@ impl SessionState {
     )
     .map_err(|error| {
       shared.settled.set(true);
-      shared.snapshot.borrow_mut().take();
+      shared.invocation.borrow_mut().take();
       unsafe {
         let rejected = Box::from_raw(rejected_context);
         rejected.session_reference.delete();
@@ -2223,13 +2255,13 @@ impl SessionState {
       Ok(then) => then,
       Err(error) => {
         shared.settled.set(true);
-        shared.snapshot.borrow_mut().take();
+        shared.invocation.borrow_mut().take();
         return Err(error);
       }
     };
     if let Err(error) = call_function(self.env, promise, then, &[fulfilled, rejected]) {
       shared.settled.set(true);
-      shared.snapshot.borrow_mut().take();
+      shared.invocation.borrow_mut().take();
       return Err(error);
     }
     Ok(())
@@ -2368,16 +2400,16 @@ impl SessionState {
         ),
       ));
     }
-    let snapshot = self.snapshot();
-    let retained = match self.retain_argument_resources(operation, &args) {
+    let mut invocation = InvocationResources::default();
+    let retained = match self.retain_argument_resources(operation, &args, &mut invocation) {
       Ok(retained) => retained,
       Err(error) => {
-        self.rollback(snapshot);
+        self.rollback(invocation);
         return Err(error);
       }
     };
     if operation.callback_transfer && retained.transfer_id.is_none() {
-      self.rollback(snapshot);
+      self.rollback(invocation);
       return Err(Error::new(
         Status::GenericFailure,
         "missing callback transfer carrier",
@@ -2420,11 +2452,11 @@ impl SessionState {
         let result = match raw_result {
           Ok(result) => result,
           Err(error) => {
-            self.rollback(snapshot);
+            self.rollback(invocation);
             return Err(error);
           }
         };
-        self.track_operation_result(result, operation, snapshot, this)
+        self.track_operation_result(result, operation, invocation, this)
       }
       SessionOperationDispatch::CallbackHostSync {
         callback_type_id,
@@ -2432,7 +2464,7 @@ impl SessionState {
       } => match self.dispatch_callback_host(callback_type_id, method_id, args, false) {
         Ok(result) => Ok(result),
         Err(error) => {
-          self.rollback(snapshot);
+          self.rollback(invocation);
           Err(error)
         }
       },
@@ -2443,20 +2475,20 @@ impl SessionState {
         let result = match self.dispatch_callback_host(callback_type_id, method_id, args, true) {
           Ok(result) => result,
           Err(error) => {
-            self.rollback(snapshot);
+            self.rollback(invocation);
             return Err(error);
           }
         };
         if is_thenable(self.env, result)? {
           if let Err(error) = self.begin_pending_work() {
-            self.rollback(snapshot);
+            self.rollback(invocation);
             return Err(error);
           }
           if let Err(error) =
-            self.attach_promise_settlement(result, &[], Vec::new(), snapshot.clone(), this)
+            self.attach_promise_settlement(result, &[], Vec::new(), invocation.clone(), this)
           {
             self.finish_pending_work();
-            self.rollback(snapshot);
+            self.rollback(invocation);
             return Err(error);
           }
         }
@@ -2475,7 +2507,7 @@ impl SessionState {
         match raw_result {
           Ok(result) => Ok(result),
           Err(error) => {
-            self.rollback(snapshot);
+            self.rollback(invocation);
             Err(error)
           }
         }
@@ -2493,7 +2525,7 @@ impl SessionState {
         match raw_result {
           Ok(result) => Ok(result),
           Err(error) => {
-            self.rollback(snapshot);
+            self.rollback(invocation);
             Err(error)
           }
         }
@@ -4143,7 +4175,7 @@ impl LateResultCleanup {
 struct SettlementShared {
   gate: Arc<LifecycleGate>,
   settled: Cell<bool>,
-  snapshot: RefCell<Option<InvocationSnapshot>>,
+  invocation: RefCell<Option<InvocationResources>>,
   session_references: RefCell<Vec<Arc<PendingSessionRef>>>,
   late_result_cleanup: Arc<LateResultCleanup>,
 }
@@ -4419,13 +4451,18 @@ unsafe extern "C" fn async_result_fulfilled(
       return js_undefined(env);
     }
     let state = context.shared.state();
+    let mut invocation = context
+      .shared
+      .invocation
+      .borrow_mut()
+      .take()
+      .unwrap_or_default();
     let outcome = if let Some(state) = state {
       if state.closing.get() || state.closed.get() {
         // close() has already drained every public lease and shut down the
         // callback release TSFN.  Do not run callback/input tracking for this
         // late result.  Native object/output values still own a native handle,
         // so release that handle directly without registering a new lease.
-        context.shared.snapshot.borrow_mut().take();
         let session_value = reference_value(
           env,
           context.session_reference.reference.load(Ordering::Acquire),
@@ -4439,9 +4476,7 @@ unsafe extern "C" fn async_result_fulfilled(
         let result_is_error = call_result_is_error(env, args[0]);
         match result_is_error {
           Ok(true) => {
-            if let Some(snapshot) = context.shared.snapshot.borrow_mut().take() {
-              state.rollback(snapshot);
-            }
+            state.rollback(invocation);
             Ok(())
           }
           Ok(false) => {
@@ -4449,20 +4484,17 @@ unsafe extern "C" fn async_result_fulfilled(
               args[0],
               &context.result_resources,
               &context.callback_arguments,
+              &mut invocation,
             ) {
               Ok(()) => Ok(()),
               Err(error) => {
-                if let Some(snapshot) = context.shared.snapshot.borrow_mut().take() {
-                  state.rollback(snapshot);
-                }
+                state.rollback(invocation);
                 Err(error)
               }
             }
           }
           Err(error) => {
-            if let Some(snapshot) = context.shared.snapshot.borrow_mut().take() {
-              state.rollback(snapshot);
-            }
+            state.rollback(invocation);
             Err(error)
           }
         }
@@ -4503,10 +4535,10 @@ unsafe extern "C" fn async_result_rejected(
     return js_undefined(env).unwrap_or(ptr::null_mut());
   }
   if let Some(state) = context.shared.state() {
-    let snapshot = context.shared.snapshot.borrow_mut().take();
+    let invocation = context.shared.invocation.borrow_mut().take();
     if !state.closing.get() && !state.closed.get() {
-      if let Some(snapshot) = snapshot {
-        state.rollback(snapshot);
+      if let Some(invocation) = invocation {
+        state.rollback(invocation);
       }
     }
   }
@@ -4757,9 +4789,9 @@ unsafe extern "C" fn finalize_async_result_context(
     let context = unsafe { Box::from_raw(data.cast::<AsyncResultContext>()) };
     if !context.shared.settled.replace(true) {
       if let Some(state) = context.shared.state() {
-        if let Some(snapshot) = context.shared.snapshot.borrow_mut().take() {
+        if let Some(invocation) = context.shared.invocation.borrow_mut().take() {
           if !state.closing.get() && !state.closed.get() {
-            state.rollback(snapshot);
+            state.rollback(invocation);
           }
         }
       }
